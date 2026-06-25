@@ -1,0 +1,558 @@
+use std::any::Any;
+use std::fmt::{self, Debug};
+
+use crate::log;
+
+use crate::ast::{BinOp, Block, Element, Expr, FuncBody, Stmt, UnOp};
+use crate::lexer::{Lexer, Token};
+use crate::source::{Source, Span, Spanned};
+
+#[derive(Debug)]
+pub enum Error {
+    Lexer(crate::lexer::Error),
+    Todo {
+        message: &'static str,
+        span: Span,
+    },
+    Unexpected {
+        message: Option<&'static str>,
+        expected: Vec<String>,
+        found: Spanned<Token>,
+        started: Option<Span>,
+    },
+}
+
+impl Error {
+    pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
+        match self {
+            Self::Lexer(error) => error.pretty_print(source, out),
+            Self::Todo { message, span } => {
+                out.write_fmt(format_args!("todo: {message}\n"))?;
+                source.print_span(*span, out)
+            }
+            Self::Unexpected {
+                message,
+                expected,
+                found,
+                started,
+            } => {
+                out.write_str("error: ")?;
+                if let Some(message) = message {
+                    out.write_fmt(format_args!("Expected {message}"))?;
+                    if expected.len() == 1 {
+                        out.write_fmt(format_args!(" (token `{}`)", expected[0]))?;
+                    } else if expected.len() > 1 {
+                        out.write_fmt(format_args!(" (tokens {:?})", expected))?;
+                    }
+                    out.write_str(", but found")?;
+                } else if expected.len() == 1 {
+                    out.write_fmt(format_args!("Expected token `{}`, but found", expected[0]))?;
+                } else {
+                    out.write_str("Unexpected")?;
+                }
+                out.write_fmt(format_args!(" token `{:?}`\n", found.data))?;
+                source.print_span(found.span, out)?;
+                if let Some(started) = started {
+                    out.write_str("note: Started by\n")?;
+                    source.print_span(*started, out)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(PartialOrd, Ord, PartialEq, Eq)]
+enum Precedence {
+    Zero = 0,
+    Assign = 10,
+    LOr = 20,            // ||
+    LAnd = 30,           // &&
+    Comparison = 40,     // == != < > <= >=
+    Additive = 50,       // + -
+    Bitwise = 60,        // & |
+    BitShift = 70,       // << >>
+    Modular = 80,        // %
+    Multiplicative = 90, // * /
+    Unary = 100,         // prefix operators
+    Suffix = 110,        // ++ --
+    Member = 120,        // . (field access)
+    Call = 130,          // () []
+}
+
+pub struct Parser<'a> {
+    pub source: &'a Source,
+    pub tokens: Vec<Spanned<Token>>,
+    pub pos: usize,
+    eof: Spanned<Token>,
+}
+
+impl<'a> Parser<'a> {
+    pub fn try_new(source: &'a Source) -> Result<Parser<'a>, Error> {
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize().map_err(Error::Lexer)?;
+        Ok(Self::new(source, tokens))
+    }
+
+    pub fn new(source: &'a Source, tokens: Vec<Spanned<Token>>) -> Parser<'a> {
+        let eof = tokens.last().unwrap().clone();
+        Parser {
+            source,
+            tokens,
+            pos: 0,
+            eof,
+        }
+    }
+
+    fn current(&self) -> &Spanned<Token> {
+        self.tokens.get(self.pos).unwrap_or(&self.eof)
+    }
+
+    fn peek(&self, n: usize) -> &Spanned<Token> {
+        self.tokens.get(self.pos + n).unwrap_or(&self.eof)
+    }
+
+    fn advance(&mut self) {
+        if self.pos < self.tokens.len() {
+            self.pos += 1;
+        }
+    }
+
+    fn expect_identifier(
+        &mut self,
+        message: Option<&'static str>,
+    ) -> Result<Spanned<String>, Error> {
+        let token = self.current();
+        let Token::Identifier(ident) = &token.data else {
+            return Err(Error::Unexpected {
+                message,
+                expected: vec!["Identifier".to_string()],
+                found: token.to_owned(),
+                started: None,
+            });
+        };
+        let ident = token.span.attach(ident.to_owned());
+        self.advance();
+        Ok(ident)
+    }
+
+    fn expect(
+        &mut self,
+        expected: Token,
+        message: Option<&'static str>,
+        started: Option<Span>,
+    ) -> Result<Span, Error> {
+        if !self.current().same_kind_as(&expected) {
+            return Err(Error::Unexpected {
+                message,
+                expected: vec![format!("{expected:?}")],
+                found: self.current().clone(),
+                started,
+            });
+        }
+        let span = self.current().span;
+        self.advance();
+        Ok(span)
+    }
+
+    pub fn parse(&mut self) -> Result<Vec<Spanned<Stmt>>, Error> {
+        let mut stmts = Vec::new();
+        while !self.current().same_kind_as(&Token::Eof) {
+            let stmt = self.parse_stmt()?;
+            stmts.push(stmt);
+        }
+        self.expect(Token::Eof, None, None)?;
+        Ok(stmts)
+    }
+
+    pub fn parse_block(&mut self) -> Result<Spanned<Vec<Spanned<Stmt>>>, Error> {
+        let mut stmts = Vec::new();
+        let start = self.current().span.start;
+        loop {
+            match self.current().data {
+                Token::Eof | Token::End | Token::ElseIf | Token::Else => break,
+                _ => {}
+            }
+            let stmt = self.parse_stmt()?;
+            stmts.push(stmt);
+        }
+        let end = self.current().span.end;
+        Ok(Span { start, end }.attach(stmts))
+    }
+
+    pub fn parse_stmt(&mut self) -> Result<Spanned<Stmt>, Error> {
+        let token = self.current();
+        let span = token.span;
+        let (is_local, token) = if let Token::Local = token.data {
+            self.advance();
+            (true, self.current())
+        } else {
+            (false, token)
+        };
+        let expected_local = || Error::Unexpected {
+            message: None,
+            expected: vec![],
+            found: token.to_owned(),
+            started: None,
+        };
+        let expr = match &token.data {
+            Token::Break => {
+                if is_local {
+                    return Err(expected_local());
+                }
+                self.advance();
+                span.attach(Stmt::Break)
+            }
+            Token::Return => {
+                if is_local {
+                    return Err(expected_local());
+                }
+                self.advance();
+                let expr = self.parse_expr()?;
+                let values = span.merge(expr.span).attach(vec![expr]);
+                span.attach(Stmt::Return { values })
+            }
+            Token::If => {
+                if is_local {
+                    return Err(expected_local());
+                }
+                self.advance();
+                let condition = self.parse_expr()?;
+                self.expect(Token::Then, None, None)?;
+                let then_block = self.parse_block()?;
+                let mut else_if_blocks = Vec::new();
+                while self.current().same_kind_as(&Token::ElseIf) {
+                    self.advance();
+                    let condition = self.parse_expr()?;
+                    self.expect(Token::Then, None, None)?;
+                    let then_block = self.parse_block()?;
+                    else_if_blocks.push((condition, then_block));
+                }
+                let else_block = if self.current().same_kind_as(&Token::Else) {
+                    self.advance();
+                    let else_block = self.parse_block()?;
+                    Some(else_block)
+                } else {
+                    None
+                };
+                let end = self.expect(Token::End, None, None)?;
+                span.merge(end).attach(Stmt::If {
+                    condition: Box::new(condition),
+                    then_block,
+                    else_if_blocks,
+                    else_block,
+                })
+            }
+            Token::Function => {
+                self.advance();
+                let name = self.expect_identifier(Some("function name"))?;
+                self.expect(Token::LParen, None, None)?;
+                self.expect(Token::RParen, None, None)?;
+                let body = self.parse_block()?;
+                let end = self.expect(Token::End, None, None)?;
+                span.merge(end).attach(Stmt::FuncDef {
+                    is_local,
+                    name,
+                    body: FuncBody { args: vec![], body },
+                })
+            }
+            Token::Identifier(ident) => {
+                let ident = span.attach(ident.to_owned());
+                self.advance();
+                let token = self.current();
+                let lhs_span = span;
+                if token.same_kind_as(&Token::LParen) {
+                    if is_local {
+                        return Err(Error::Unexpected {
+                            message: None,
+                            expected: vec![],
+                            found: token.to_owned(),
+                            started: None,
+                        });
+                    }
+                    self.advance();
+                    let args = self.parse_expr_list(Token::RParen)?;
+                    let last_span =
+                        self.expect(Token::RParen, Some("end of arg list"), Some(span))?;
+                    return Ok(span
+                        .merge(last_span)
+                        .attach(Stmt::Call { name: ident, args }));
+                }
+                let mut lhs = vec![ident];
+                let mut last_span = lhs_span;
+                while self.current().same_kind_as(&Token::Comma) {
+                    self.advance();
+                    let ident = self.expect_identifier(None)?;
+                    last_span = ident.span;
+                    lhs.push(ident);
+                }
+                self.expect(Token::Assign, None, None)?;
+                let lhs = lhs_span.merge(last_span).attach(lhs);
+
+                let expr = self.parse_expr()?;
+                let rhs_span = expr.span;
+                let mut last_span = rhs_span;
+                let mut rhs = vec![expr];
+                while self.current().same_kind_as(&Token::Comma) {
+                    self.advance();
+                    let expr = self.parse_expr()?;
+                    last_span = expr.span;
+                    rhs.push(expr);
+                }
+                let rhs = rhs_span.merge(last_span).attach(rhs);
+
+                span.merge(last_span)
+                    .attach(Stmt::Assigns { is_local, lhs, rhs })
+            }
+            _ => {
+                return Err(Error::Unexpected {
+                    message: Some("TODO"),
+                    expected: vec![],
+                    found: self.current().to_owned(),
+                    started: None,
+                });
+            }
+        };
+        Ok(expr)
+    }
+
+    fn peek_infix_precedence(&self) -> Option<usize> {
+        match self.current().data {
+            Token::Add | Token::Minus | Token::Concat => Some(Precedence::Additive),
+            Token::Modulo => Some(Precedence::Modular),
+            Token::Times | Token::Divide | Token::Modulo => Some(Precedence::Multiplicative),
+            Token::BitAnd | Token::BitOr | Token::BitXor => Some(Precedence::Bitwise),
+            Token::LShift | Token::RShift => Some(Precedence::BitShift),
+            Token::And => Some(Precedence::LAnd),
+            Token::Or => Some(Precedence::LOr),
+            Token::LParen | Token::LBracket | Token::LBrace => Some(Precedence::Call),
+            Token::Dot | Token::Colon => Some(Precedence::Member),
+            Token::EQ | Token::NE | Token::LT | Token::GT | Token::LE | Token::GE => {
+                Some(Precedence::Comparison)
+            }
+            _ => None,
+        }
+        .map(|p| p as usize)
+    }
+
+    fn parse_expr(&mut self) -> Result<Spanned<Expr>, Error> {
+        self.parse_expr_inner(0)
+    }
+
+    fn parse_expr_inner(&mut self, min_precedence: usize) -> Result<Spanned<Expr>, Error> {
+        let mut expr = self.parse_primary()?;
+        while let Some(op_precedence) = self.peek_infix_precedence() {
+            if op_precedence < min_precedence {
+                break;
+            }
+            expr = self.parse_infix(expr, op_precedence)?;
+        }
+        Ok(expr)
+    }
+
+    fn parse_infix(
+        &mut self,
+        lhs: Spanned<Expr>,
+        precedence: usize,
+    ) -> Result<Spanned<Expr>, Error> {
+        let token = self.current();
+        let op = match token.data {
+            Token::Add => BinOp::Add,
+            Token::Minus => BinOp::Sub,
+            Token::Concat => BinOp::Concat,
+            Token::Times => BinOp::Mul,
+            Token::Divide => BinOp::Div,
+            Token::Modulo => BinOp::Mod,
+            Token::BitAnd => BinOp::BitAnd,
+            Token::BitOr => BinOp::BitOr,
+            Token::BitXor => BinOp::BitXor,
+            Token::LShift => BinOp::Shl,
+            Token::RShift => BinOp::Shr,
+            Token::And => BinOp::And,
+            Token::Or => BinOp::Or,
+            Token::EQ => BinOp::EQ,
+            Token::NE => BinOp::NE,
+            Token::LT => BinOp::LT,
+            Token::GT => BinOp::GT,
+            Token::LE => BinOp::LE,
+            Token::GE => BinOp::GE,
+            Token::Dot | Token::Colon => {
+                self.advance();
+                let member = self.expect_identifier(Some("member"))?;
+                let expr = lhs.span.merge(member.span).attach(Expr::Member {
+                    val: Box::new(lhs),
+                    member,
+                });
+                return Ok(expr);
+            }
+            Token::LParen | Token::LBracket | Token::LBrace => todo!(),
+            _ => panic!(),
+        };
+        let op = token.span.attach(op);
+        self.advance();
+        let rhs = self.parse_expr_inner(precedence + 1)?;
+        let expr = lhs.span.merge(rhs.span).attach(Expr::BinOp {
+            rhs: Box::new(rhs),
+            lhs: Box::new(lhs),
+            op,
+        });
+        Ok(expr)
+    }
+
+    fn parse_primary(&mut self) -> Result<Spanned<Expr>, Error> {
+        let span = self.current().span;
+        let expr = match &self.current().data {
+            Token::Nil => {
+                self.advance();
+                span.attach(Expr::Nil)
+            }
+            Token::True => {
+                self.advance();
+                span.attach(Expr::True)
+            }
+            Token::False => {
+                self.advance();
+                span.attach(Expr::False)
+            }
+            Token::Integer(n) => {
+                let n = *n;
+                self.advance();
+                span.attach(Expr::Integer(n as i64))
+            }
+            Token::String(s) => {
+                let s = s.to_owned();
+                self.advance();
+                span.attach(Expr::String(s))
+            }
+            Token::Add => {
+                self.advance();
+                let expr = self.parse_expr_inner(Precedence::Unary as usize)?;
+                expr
+            }
+            Token::Minus => {
+                self.advance();
+                let expr = self.parse_expr_inner(Precedence::Unary as usize)?;
+                span.merge(expr.span).attach(Expr::UnOp {
+                    val: Box::new(expr),
+                    op: span.attach(UnOp::Neg),
+                })
+            }
+            Token::Not => {
+                self.advance();
+                let expr = self.parse_expr_inner(Precedence::Unary as usize)?;
+                span.merge(expr.span).attach(Expr::UnOp {
+                    val: Box::new(expr),
+                    op: span.attach(UnOp::Not),
+                })
+            }
+            Token::LParen => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                self.expect(Token::RParen, None, None)?;
+                expr
+            }
+            Token::LBrace => {
+                self.advance();
+                let mut elements = Vec::new();
+                while !self.current().same_kind_as(&Token::RBrace) {
+                    let token = self.current();
+                    match &token.data {
+                        Token::Identifier(name) if self.peek(1).same_kind_as(&Token::Assign) => {
+                            let name = token.span.attach(name.to_owned());
+                            self.advance();
+                            self.advance();
+                            let expr = self.parse_expr()?;
+                            elements.push(
+                                name.span
+                                    .merge(expr.span)
+                                    .attach(Element::Named { name, expr }),
+                            );
+                        }
+                        _ => {
+                            let expr = self.parse_expr()?;
+                            elements.push(expr.span.attach(Element::Indexed(expr)));
+                        }
+                    }
+                    if !self.current().same_kind_as(&Token::Comma) {
+                        break;
+                    }
+                    self.advance();
+                }
+                let last_span = self.expect(Token::RBrace, None, None)?;
+                span.merge(last_span).attach(Expr::Table { elements })
+            }
+            Token::Identifier(name) => {
+                let name = name.to_owned();
+                self.advance();
+                let started = self.current().span;
+                match self.current().data {
+                    Token::LParen => {
+                        self.advance();
+                        let args = self.parse_expr_list(Token::RParen)?;
+                        let last_span =
+                            self.expect(Token::RParen, Some("end of constructor"), Some(started))?;
+                        let name = span.attach(name);
+                        span.merge(last_span).attach(Expr::Call { name, args })
+                    }
+                    // Token::LBrace => {
+                    //     self.advance();
+                    //     let args = self.parse_named_expr_list(Token::RBrace)?;
+                    //     let last_span =
+                    //         self.expect(Token::RBrace, Some("end of named constructor"), started)?;
+                    //     span.merge(last_span)
+                    //         .attach(Expr::NamedConstructor { name: path, args })
+                    // }
+                    _ => {
+                        let ident = Expr::Identifier(name);
+                        span.attach(ident)
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::Unexpected {
+                    expected: Vec::new(),
+                    message: Some("primary expression"),
+                    found: self.current().clone(),
+                    started: None,
+                });
+            }
+        };
+        Ok(expr)
+    }
+
+    fn parse_expr_list(&mut self, terminator: Token) -> Result<Spanned<Vec<Spanned<Expr>>>, Error> {
+        let span = self.current().span;
+        let mut last_span = span;
+        let mut exprs = Vec::new();
+        while !self.current().same_kind_as(&terminator) {
+            let expr = self.parse_expr()?;
+            last_span = expr.span;
+            exprs.push(expr);
+            if self.current().same_kind_as(&Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(span.merge(last_span).attach(exprs))
+    }
+
+    // fn parse_block(&mut self) -> Result<Spanned<Block>, Error> {
+    //     let span = self.expect(Token::LBrace, Some("start of block"), None)?;
+    //     let mut exprs = Vec::new();
+    //     let mut value = None;
+    //     while self.current() != Token::RBrace {
+    //         let expr = self.parse_expr()?;
+    //         if self.current() == Token::Semicolon {
+    //             self.advance();
+    //             exprs.push(expr);
+    //         } else {
+    //             value = Some(Box::new(expr));
+    //             break;
+    //         }
+    //     }
+    //     let last_span = self.expect(Token::RBrace, Some("end of block"), Some(span))?;
+    //     Ok(span.merge(last_span).attach(Block { exprs, value }))
+    // }
+}
