@@ -1,15 +1,11 @@
-use std::any::Any;
 use std::fmt::{self, Debug};
 
-use crate::log;
-
-use crate::ast::{BinOp, Block, Element, Expr, FuncBody, Stmt, UnOp};
-use crate::lexer::{Lexer, Token};
+use crate::ast::{BinOp, Element, Expr, FieldConstructor, FieldDef, FuncBody, Stmt, Type, UnOp};
+use crate::lexer::Token;
 use crate::source::{Source, Span, Spanned};
 
 #[derive(Debug)]
 pub enum Error {
-    Lexer(crate::lexer::Error),
     Todo {
         message: &'static str,
         span: Span,
@@ -25,7 +21,6 @@ pub enum Error {
 impl Error {
     pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
         match self {
-            Self::Lexer(error) => error.pretty_print(source, out),
             Self::Todo { message, span } => {
                 out.write_fmt(format_args!("todo: {message}\n"))?;
                 source.print_span(*span, out)
@@ -89,12 +84,6 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub fn try_new(source: &'a Source) -> Result<Parser<'a>, Error> {
-        let mut lexer = Lexer::new(source);
-        let tokens = lexer.tokenize().map_err(Error::Lexer)?;
-        Ok(Self::new(source, tokens))
-    }
-
     pub fn new(source: &'a Source, tokens: Vec<Spanned<Token>>) -> Parser<'a> {
         let eof = tokens.last().unwrap().clone();
         Parser {
@@ -117,6 +106,50 @@ impl<'a> Parser<'a> {
         if self.pos < self.tokens.len() {
             self.pos += 1;
         }
+    }
+
+    fn expect_type(&mut self, message: Option<&'static str>) -> Result<Spanned<Type>, Error> {
+        let mut nesting = 0;
+        let mut starts = Vec::new();
+        let span = self.current().span;
+        while self.current().same_kind_as(&Token::LBracket) {
+            starts.push(self.current().span);
+            self.advance();
+            nesting += 1;
+        }
+        let mut last_span = span;
+        let typ = if self.current().same_kind_as(&Token::Function) {
+            self.advance();
+            self.expect(Token::LParen, None, None)?;
+            let mut args = Vec::new();
+            while !self.current().same_kind_as(&Token::RParen) {
+                let arg = self.expect_type(Some("parameter type"))?;
+                args.push(arg);
+                if self.current().same_kind_as(&Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            last_span = self.expect(Token::RParen, None, None)?;
+            let ret = if self.current().same_kind_as(&Token::Colon) {
+                self.advance();
+                let ret = self.expect_type(Some("return type"))?;
+                last_span = ret.span;
+                Some(Box::new(ret))
+            } else {
+                None
+            };
+            Type::Function { nesting, args, ret }
+        } else {
+            let name = self.expect_identifier(message)?;
+            Type::Named { nesting, name }
+        };
+        for i in 0..nesting {
+            last_span = self.expect(Token::RBracket, None, Some(starts[starts.len() - i - 1]))?;
+        }
+        let typ = span.merge(last_span).attach(typ);
+        Ok(typ)
     }
 
     fn expect_identifier(
@@ -168,17 +201,19 @@ impl<'a> Parser<'a> {
 
     pub fn parse_block(&mut self) -> Result<Spanned<Vec<Spanned<Stmt>>>, Error> {
         let mut stmts = Vec::new();
-        let start = self.current().span.start;
+        let span = self.current().span;
+        let mut last_span = span;
         loop {
             match self.current().data {
                 Token::Eof | Token::End | Token::ElseIf | Token::Else => break,
                 _ => {}
             }
             let stmt = self.parse_stmt()?;
+            last_span = stmt.span;
             stmts.push(stmt);
         }
-        let end = self.current().span.end;
-        Ok(Span { start, end }.attach(stmts))
+        let stmts = span.merge(last_span).attach(stmts);
+        Ok(stmts)
     }
 
     pub fn parse_stmt(&mut self) -> Result<Spanned<Stmt>, Error> {
@@ -213,6 +248,37 @@ impl<'a> Parser<'a> {
                 let values = span.merge(expr.span).attach(vec![expr]);
                 span.attach(Stmt::Return { values })
             }
+            Token::Struct => {
+                self.advance();
+                let name = self.expect_identifier(Some("type name"))?;
+                let mut fields = Vec::new();
+                let field_start = self.current().span;
+                let mut field_end = field_start;
+                while !self.current().same_kind_as(&Token::End) {
+                    let name = self.expect_identifier(Some("field name"))?;
+                    self.expect(Token::Colon, None, None)?;
+                    let typ = self.expect_type(Some("field type"))?;
+                    field_end = typ.span;
+                    fields.push(name.span.merge(typ.span).attach(FieldDef { name, typ }));
+                }
+                let fields = field_start.merge(field_end).attach(fields);
+                let last_span = self.current().span;
+                self.advance();
+                span.merge(last_span).attach(Stmt::TypeDef { name, fields })
+            }
+            Token::Function => {
+                self.advance();
+                let name = self.expect_identifier(Some("function name"))?;
+                self.expect(Token::LParen, None, None)?;
+                self.expect(Token::RParen, None, None)?;
+                let body = self.parse_block()?;
+                let end = self.expect(Token::End, None, None)?;
+                span.merge(end).attach(Stmt::FuncDef {
+                    is_local,
+                    name,
+                    body: FuncBody { args: vec![], body },
+                })
+            }
             Token::If => {
                 if is_local {
                     return Err(expected_local());
@@ -242,19 +308,6 @@ impl<'a> Parser<'a> {
                     then_block,
                     else_if_blocks,
                     else_block,
-                })
-            }
-            Token::Function => {
-                self.advance();
-                let name = self.expect_identifier(Some("function name"))?;
-                self.expect(Token::LParen, None, None)?;
-                self.expect(Token::RParen, None, None)?;
-                let body = self.parse_block()?;
-                let end = self.expect(Token::End, None, None)?;
-                span.merge(end).attach(Stmt::FuncDef {
-                    is_local,
-                    name,
-                    body: FuncBody { args: vec![], body },
                 })
             }
             Token::Identifier(ident) => {
@@ -321,7 +374,7 @@ impl<'a> Parser<'a> {
         match self.current().data {
             Token::Add | Token::Minus | Token::Concat => Some(Precedence::Additive),
             Token::Modulo => Some(Precedence::Modular),
-            Token::Times | Token::Divide | Token::Modulo => Some(Precedence::Multiplicative),
+            Token::Times | Token::Divide => Some(Precedence::Multiplicative),
             Token::BitAnd | Token::BitOr | Token::BitXor => Some(Precedence::Bitwise),
             Token::LShift | Token::RShift => Some(Precedence::BitShift),
             Token::And => Some(Precedence::LAnd),
@@ -386,7 +439,9 @@ impl<'a> Parser<'a> {
                 });
                 return Ok(expr);
             }
-            Token::LParen | Token::LBracket | Token::LBrace => todo!(),
+            Token::LParen => todo!("method call"),
+            Token::LBracket => todo!("indexing"),
+            Token::LBrace => todo!("struct"),
             _ => panic!(),
         };
         let op = token.span.attach(op);
@@ -427,8 +482,7 @@ impl<'a> Parser<'a> {
             }
             Token::Add => {
                 self.advance();
-                let expr = self.parse_expr_inner(Precedence::Unary as usize)?;
-                expr
+                self.parse_expr_inner(Precedence::Unary as usize)?
             }
             Token::Minus => {
                 self.advance();
@@ -495,14 +549,39 @@ impl<'a> Parser<'a> {
                         let name = span.attach(name);
                         span.merge(last_span).attach(Expr::Call { name, args })
                     }
-                    // Token::LBrace => {
-                    //     self.advance();
-                    //     let args = self.parse_named_expr_list(Token::RBrace)?;
-                    //     let last_span =
-                    //         self.expect(Token::RBrace, Some("end of named constructor"), started)?;
-                    //     span.merge(last_span)
-                    //         .attach(Expr::NamedConstructor { name: path, args })
-                    // }
+                    Token::LBrace => {
+                        self.advance();
+                        let mut fields = Vec::new();
+                        let field_start = self.current().span;
+                        let mut field_end = field_start;
+                        while !self.current().same_kind_as(&Token::RBrace) {
+                            let name = self.expect_identifier(Some("field"))?;
+                            if !self.current().same_kind_as(&Token::Colon) {
+                                fields
+                                    .push(name.span.attach(FieldConstructor::Implicit(name.data)));
+                            } else {
+                                self.advance();
+                                let expr = self.parse_expr()?;
+                                field_end = expr.span;
+                                fields.push(
+                                    name.span
+                                        .merge(expr.span)
+                                        .attach(FieldConstructor::Explicit { name, expr }),
+                                );
+                            }
+                            if self.current().same_kind_as(&Token::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        let fields = field_start.merge(field_end).attach(fields);
+                        let last_span = self.expect(Token::RBrace, None, None)?;
+                        span.merge(last_span).attach(Expr::TypeConstructor {
+                            name: span.attach(name),
+                            fields,
+                        })
+                    }
                     _ => {
                         let ident = Expr::Identifier(name);
                         span.attach(ident)

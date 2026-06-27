@@ -10,16 +10,14 @@ use crossterm::{
     terminal,
 };
 
-// use crate::ast::{Block, Expr, NamedExpr, NamedPattern, Path, Pattern};
 use crate::log;
 use crate::logger::LOGGER;
+
+use crate::ast::{Element, Expr, FieldConstructor, Stmt};
+use crate::interpreter;
+use crate::lexer::{self, Lexer, Token};
 use crate::parser::{self, Parser};
-use crate::{ast::Element, interpreter};
-use crate::{
-    ast::{Expr, Stmt},
-    lexer::{self, Lexer, Token},
-};
-// use crate::resolution::{self, Env, resolve_exprs};
+use crate::resolution;
 use crate::source::{Source, Span, Spanned};
 
 // ---------------------------------------------------------------------------
@@ -49,7 +47,8 @@ fn token_color(kind: &Token) -> Color {
         | Token::ElseIf
         | Token::Function
         | Token::Local
-        | Token::Return => Color::AnsiValue(130),
+        | Token::Return
+        | Token::Struct => Color::AnsiValue(130),
 
         // Keywords and operators
         Token::Not
@@ -402,6 +401,19 @@ impl Editor {
                 Box::new(TextPane::new("Parser", |ctx| match &ctx.output.result {
                     Err(error) | Ok((_, Err(error))) => error.clone(),
                     Ok((_tokens, Ok((ast, _)))) => format!("{ast:#?}"),
+                })),
+                Box::new(TextPane::new("Resolution", |ctx| {
+                    match &ctx.output.result {
+                        Err(error) | Ok((_, Err(error))) => error.clone(),
+                        Ok((_tokens, Ok((ast, _)))) => match resolution::run(ast) {
+                            Ok(res) => format!("{res:#?}"),
+                            Err(error) => {
+                                let mut out = String::new();
+                                let _ = error.pretty_print(&ctx.source, &mut out);
+                                out
+                            }
+                        },
+                    }
                 })),
                 Box::new(TextPane::new("Exec", |ctx| match &ctx.output.result {
                     Err(error) | Ok((_, Err(error))) => error.clone(),
@@ -1140,6 +1152,14 @@ impl EditorPane {
 
 fn ast_path_at(stmts: &[Spanned<Stmt>], cursor: usize) -> Vec<AstNode> {
     let mut path = Vec::new();
+    path.push(AstNode {
+        label: "Program",
+        span: Span {
+            start: stmts.first().map_or(0, |s| s.span.start),
+            end: stmts.last().map_or(0, |s| s.span.end),
+        },
+        weak: true,
+    });
     for stmt in stmts {
         if stmt.contains(cursor) {
             visit_stmt(stmt, cursor, &mut path);
@@ -1226,6 +1246,60 @@ fn visit_stmt(stmt: &Spanned<Stmt>, cursor: usize, path: &mut Vec<AstNode>) {
                 }
             }
         }
+        Stmt::TypeDef { name, fields } => {
+            if name.contains(cursor) {
+                path.push(AstNode {
+                    label: "TypeName",
+                    span: name.span,
+                    weak: true,
+                });
+                return;
+            }
+            if fields.contains(cursor) {
+                path.push(AstNode {
+                    label: "TypeFields",
+                    span: fields.span,
+                    weak: true,
+                });
+                for field in &fields.data {
+                    if field.contains(cursor) {
+                        path.push(AstNode {
+                            label: "TypeField",
+                            span: field.span,
+                            weak: true,
+                        });
+                        if field.name.contains(cursor) {
+                            path.push(AstNode {
+                                label: "FieldName",
+                                span: field.name.span,
+                                weak: true,
+                            });
+                        }
+                        if field.typ.contains(cursor) {
+                            path.push(AstNode {
+                                label: "FieldType",
+                                span: field.typ.span,
+                                weak: true,
+                            });
+                            // match &field.typ.data {
+                            //     Type::Named { nesting, name } => {
+                            //         if *nesting > 0 && name.contains(cursor) {
+                            //             path.push(AstNode {
+                            //                 label: "NestedFieldTypeName",
+                            //                 span: name.span,
+                            //                 weak: true,
+                            //             });
+                            //         }
+                            //     }
+                            //     Type::Function { nesting, args, ret } => {
+                            //     },
+                            // }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         Stmt::FuncDef {
             is_local,
             name,
@@ -1236,8 +1310,10 @@ fn visit_stmt(stmt: &Spanned<Stmt>, cursor: usize, path: &mut Vec<AstNode>) {
                     label: "FunctionName",
                     span: name.span,
                     weak: true,
-                })
-            } else {
+                });
+                return;
+            }
+            if body.body.contains(cursor) {
                 visit_stmts(&body.body, cursor, path);
             }
         }
@@ -1283,6 +1359,60 @@ fn visit_expr(expr: &Spanned<Expr>, cursor: usize, path: &mut Vec<AstNode>) {
                         }
                     }
                     break;
+                }
+            }
+        }
+        Expr::TypeConstructor { name, fields } => {
+            if name.contains(cursor) {
+                path.push(AstNode {
+                    label: "TypeName",
+                    span: name.span,
+                    weak: true,
+                });
+                return;
+            }
+            if fields.contains(cursor) {
+                path.push(AstNode {
+                    label: "FieldConstructorList",
+                    span: fields.span,
+                    weak: true,
+                });
+                for field in &fields.data {
+                    if field.contains(cursor) {
+                        match &field.data {
+                            FieldConstructor::Implicit(_) => {
+                                path.push(AstNode {
+                                    label: "ImplicitFieldConstructor",
+                                    span: field.span,
+                                    weak: true,
+                                });
+                            }
+                            FieldConstructor::Explicit { name, expr } => {
+                                path.push(AstNode {
+                                    label: "ExplicitFieldConstructor",
+                                    span: field.span,
+                                    weak: true,
+                                });
+                                if name.contains(cursor) {
+                                    path.push(AstNode {
+                                        label: "FieldConstructorName",
+                                        span: name.span,
+                                        weak: true,
+                                    });
+                                    return;
+                                }
+                                if expr.contains(cursor) {
+                                    path.push(AstNode {
+                                        label: "FieldConstructorExpression",
+                                        span: expr.span,
+                                        weak: true,
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                        return;
+                    }
                 }
             }
         }
@@ -1386,7 +1516,6 @@ fn lex_error_info(error: &lexer::Error) -> (Span, String) {
 
 fn parser_error_info(error: &parser::Error) -> (Span, String) {
     match error {
-        parser::Error::Lexer(le) => lex_error_info(le),
         parser::Error::Todo { message, span } => (*span, message.to_string()),
         parser::Error::Unexpected {
             message,

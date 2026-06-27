@@ -47,6 +47,34 @@ pub enum Element {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct FieldDef {
+    pub name: Spanned<String>,
+    pub typ: Spanned<Type>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Type {
+    Named {
+        nesting: usize,
+        name: Spanned<String>,
+    },
+    Function {
+        nesting: usize,
+        args: Vec<Spanned<Type>>,
+        ret: Option<Box<Spanned<Type>>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum FieldConstructor {
+    Implicit(String),
+    Explicit {
+        name: Spanned<String>,
+        expr: Spanned<Expr>,
+    },
+}
+
 #[derive(Clone)]
 pub enum Expr {
     // Literals
@@ -75,6 +103,11 @@ pub enum Expr {
         name: Spanned<String>,
         args: Spanned<Vec<Spanned<Expr>>>,
     },
+    TypeConstructor {
+        name: Spanned<String>,
+        fields: Spanned<Vec<Spanned<FieldConstructor>>>,
+    },
+
     Func {
         body: Spanned<FuncBody>,
     },
@@ -131,6 +164,11 @@ pub enum Stmt {
         body: Spanned<Block>,
     },
 
+    TypeDef {
+        name: Spanned<String>,
+        fields: Spanned<Vec<Spanned<FieldDef>>>,
+    },
+
     FuncDef {
         is_local: bool,
         name: Spanned<String>,
@@ -157,6 +195,7 @@ impl Expr {
             Self::BinOp { .. } => "Binary Operation",
             Self::Member { .. } => "MemberAccess",
             Self::Call { .. } => "Call",
+            Self::TypeConstructor { .. } => "TypeConstructor",
             Expr::Func { .. } => "Lambda",
         }
     }
@@ -171,7 +210,8 @@ impl Stmt {
             Self::Assign { .. } | Self::Assigns { .. } => "Assign",
             Self::If { .. } => "If/Else",
             Self::ForNum { .. } => "NumericFor",
-            Self::FuncDef { .. } => "Function",
+            Self::FuncDef { .. } => "FunctionDef",
+            Self::TypeDef { .. } => "TypeDef",
         }
     }
 }
@@ -204,9 +244,14 @@ impl fmt::Debug for Expr {
                 .field("member", member)
                 .finish(),
             Self::Call { name, args } => f
-                .debug_struct("Constructor")
+                .debug_struct("FunctionCall")
                 .field("name", name)
                 .field("args", args)
+                .finish(),
+            Self::TypeConstructor { name, fields } => f
+                .debug_struct("TypeConstructor")
+                .field("name", name)
+                .field("fields", fields)
                 .finish(),
             Self::UnOp { val, op } => f
                 .debug_struct("UnOp")

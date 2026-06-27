@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ast::{BinOp, Element, Expr, FuncBody, Stmt, UnOp};
 use crate::log;
+
+use crate::ast::{BinOp, Element, Expr, FuncBody, Stmt, UnOp};
 use crate::source::{Source, Span, Spanned};
 
 #[derive(Debug)]
@@ -73,9 +74,8 @@ enum Field {
     Index(u64),
     Name(Rc<str>),
 }
-//type Table<'a> = HashMap<Field, Value<'a>>;
 #[derive(Debug, Clone)]
-struct Table<'a> {
+pub struct Table<'a> {
     indexed: BTreeMap<u64, Value<'a>>,
     named: HashMap<Rc<str>, Value<'a>>,
 }
@@ -86,12 +86,30 @@ impl Table<'_> {
 }
 
 #[derive(Debug, Clone)]
+pub enum Type {
+    Boolean,
+    Float,
+    Integer,
+    String,
+    Struct(Proto),
+}
+
+#[derive(Debug, Clone)]
+pub struct Proto {
+    fields: Vec<(String, Type)>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Value<'a> {
     Nil,
     Boolean(bool),
     Float(f64),
     Integer(i64),
     String(Rc<str>),
+    Struct {
+        typ: &'a Proto,
+        fields: Box<[Value<'a>]>,
+    },
     Table(Rc<Table<'a>>),
     Func(&'a FuncBody),
     FFI(fn(&mut Context<'a>, span: Span, Vec<Value<'a>>) -> Result<Value<'a>, Error>),
@@ -104,6 +122,7 @@ impl Value<'_> {
             Value::Float(v) => *v != 0.,
             Value::Integer(v) => *v != 0,
             Value::String(v) => !v.is_empty(),
+            Value::Struct { .. } => true,
             Value::Table(v) => !v.is_empty(),
             Value::Func(_) => true,
             Value::FFI(_) => true,
@@ -271,7 +290,9 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
                 }
             }
             if let Some(else_block) = else_block {
+                ctx.push();
                 eval_stmts(ctx, else_block)?;
+                ctx.pop();
             }
         }
         Stmt::ForNum {
@@ -281,6 +302,7 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
             step,
             body,
         } => todo!(),
+        Stmt::TypeDef { .. } => {}
         Stmt::FuncDef {
             is_local,
             name,
@@ -316,7 +338,7 @@ pub fn inner_func_call<'a>(
     args: Vec<Value<'a>>,
 ) -> Result<Value<'a>, Error> {
     let mut scope = Scope::default();
-    for (binding, val) in func_body.args.iter().zip(args.into_iter()) {
+    for (binding, val) in func_body.args.iter().zip(args) {
         scope.insert(binding, val);
     }
     ctx.scopes.push(scope);
@@ -443,6 +465,7 @@ fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &Spanned<Expr>) -> Result<Value<'a
             };
             Ok(res)
         }
+        Expr::TypeConstructor { name, fields } => todo!(),
         Expr::Call { name, args } => func_call(ctx, name, args),
         Expr::Func { body } => todo!(),
     }

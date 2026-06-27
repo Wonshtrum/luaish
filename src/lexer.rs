@@ -38,6 +38,7 @@ pub enum Token {
     Function,
     Local,
     Return,
+    Struct,
 
     // Literals
     Nil,
@@ -333,6 +334,7 @@ impl<'a> Lexer<'a> {
                     "function" => Token::Function,
                     "local" => Token::Local,
                     "return" => Token::Return,
+                    "struct" => Token::Struct,
                     "in" => Token::In,
 
                     "nil" => Token::Nil,

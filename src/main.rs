@@ -1,3 +1,12 @@
+#![allow(unused)]
+#![allow(clippy::upper_case_acronyms)]
+#![allow(clippy::single_match)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::match_like_matches_macro)]
+
 use std::io::{Read, Write};
 
 mod ast;
@@ -6,7 +15,7 @@ mod interpreter;
 mod lexer;
 mod logger;
 mod parser;
-// mod resolution;
+mod resolution;
 mod source;
 
 fn main() {
