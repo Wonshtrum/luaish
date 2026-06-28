@@ -8,7 +8,15 @@ use crate::ast::{BinOp, Element, Expr, FuncBody, Stmt, UnOp};
 use crate::source::{Source, Span, Spanned};
 
 #[derive(Debug)]
-pub enum Error {
+pub enum Error<'a> {
+    Return {
+        span: Span,
+        value: Option<Value<'a>>,
+    },
+    Break {
+        span: Span,
+    },
+
     Custom {
         message: String,
         span: Span,
@@ -31,9 +39,14 @@ pub enum Error {
         span: Span,
     },
 }
-impl Error {
+impl Error<'_> {
     pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
         match self {
+            Self::Return { span, .. } | Self::Break { span } => {
+                out.write_fmt(format_args!("error: malformed control flow"))?;
+                source.print_span(*span, out)
+            }
+
             Self::Exit { span } => {
                 out.write_str("exit")?;
                 out.write_char('\n')?;
@@ -112,7 +125,7 @@ pub enum Value<'a> {
     },
     Table(Rc<Table<'a>>),
     Func(&'a FuncBody),
-    FFI(fn(&mut Context<'a>, span: Span, Vec<Value<'a>>) -> Result<Value<'a>, Error>),
+    FFI(fn(&mut Context<'a>, span: Span, Vec<Value<'a>>) -> Result<Option<Value<'a>>, Error<'a>>),
 }
 impl Value<'_> {
     fn truthy(&self) -> bool {
@@ -145,7 +158,7 @@ impl<'a> Context<'a> {
         self.scopes.pop();
     }
 
-    pub fn get(&mut self, ident: &str, span: Span) -> Result<Value<'a>, Error> {
+    pub fn get(&mut self, ident: &str, span: Span) -> Result<Value<'a>, Error<'a>> {
         for scope in self.scopes.iter().rev() {
             if let Some(val) = scope.get(ident) {
                 return Ok(val.clone());
@@ -156,7 +169,7 @@ impl<'a> Context<'a> {
             span,
         })
     }
-    pub fn set(&mut self, ident: &'a str, val: Value<'a>, span: Span) -> Result<(), Error> {
+    pub fn set(&mut self, ident: &'a str, val: Value<'a>, span: Span) -> Result<(), Error<'a>> {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(binding) = scope.get_mut(ident) {
                 *binding = val;
@@ -172,7 +185,7 @@ fn extern_exit<'a>(
     _ctx: &mut Context<'a>,
     span: Span,
     _args: Vec<Value<'a>>,
-) -> Result<Value<'a>, Error> {
+) -> Result<Option<Value<'a>>, Error<'a>> {
     log!("EXIT!");
     Err(Error::Exit { span })
 }
@@ -180,23 +193,23 @@ fn extern_print<'a>(
     _ctx: &mut Context<'a>,
     _span: Span,
     args: Vec<Value<'a>>,
-) -> Result<Value<'a>, Error> {
+) -> Result<Option<Value<'a>>, Error<'a>> {
     log!("PRINT {args:?}");
     let res = Value::Integer(args.len() as i64);
-    Ok(res)
+    Ok(Some(res))
 }
 fn extern_test<'a>(
     ctx: &mut Context<'a>,
     _span: Span,
     args: Vec<Value<'a>>,
-) -> Result<Value<'a>, Error> {
+) -> Result<Option<Value<'a>>, Error<'a>> {
     log!("TEST");
     match args.as_slice() {
         [Value::Func(f), Value::Integer(n)] => {
             for _ in 0..*n {
                 inner_func_call(ctx, f, args.clone())?;
             }
-            Ok(Value::Nil)
+            Ok(Some(Value::Nil))
         }
         _ => Err(Error::FFI("ffi::test")),
     }
@@ -205,7 +218,7 @@ fn extern_exec<'a>(
     ctx: &mut Context<'a>,
     _span: Span,
     args: Vec<Value<'a>>,
-) -> Result<Value<'a>, Error> {
+) -> Result<Option<Value<'a>>, Error<'a>> {
     let args = args
         .into_iter()
         .filter_map(|arg| {
@@ -220,7 +233,7 @@ fn extern_exec<'a>(
             };
             Some(Ok(arg))
         })
-        .collect::<Result<Vec<String>, Error>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
     log!("EXEC {args:?}");
     let Some(cmd) = args.first() else {
         return Err(Error::FFI("ffi::extern_test::no_args"));
@@ -232,10 +245,10 @@ fn extern_exec<'a>(
         Ok(res) => String::from_utf8_lossy(&res.stdout).to_string(),
         Err(error) => error.to_string(),
     };
-    Ok(Value::String(Rc::from(res)))
+    Ok(Some(Value::String(Rc::from(res))))
 }
 
-pub fn run(stmts: &[Spanned<Stmt>]) -> Result<String, Error> {
+pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<String, Error<'a>> {
     let mut global = Scope::default();
     global.insert("print", Value::FFI(extern_print));
     global.insert("test", Value::FFI(extern_test));
@@ -248,41 +261,56 @@ pub fn run(stmts: &[Spanned<Stmt>]) -> Result<String, Error> {
     Ok(format!("{ctx:#?}"))
 }
 
-fn eval_stmts<'a>(ctx: &mut Context<'a>, stmts: &'a [Spanned<Stmt>]) -> Result<(), Error> {
+fn eval_stmts<'a>(ctx: &mut Context<'a>, stmts: &'a [Spanned<Stmt>]) -> Result<(), Error<'a>> {
     for stmt in stmts {
         eval_stmt(ctx, stmt)?;
     }
     Ok(())
 }
 
-fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), Error> {
+fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), Error<'a>> {
     match &stmt.data {
-        Stmt::Break => todo!(),
-        Stmt::Return { values } => todo!(),
+        Stmt::Break => return Err(Error::Break { span: stmt.span }),
+        Stmt::Return { expr } => {
+            let value = if let Some(expr) = expr {
+                eval_expr(ctx, expr)?
+            } else {
+                None
+            };
+            return Err(Error::Return {
+                span: stmt.span,
+                value,
+            });
+        }
         Stmt::Call { name, args } => {
             let _ = func_call(ctx, name, args)?;
         }
-        Stmt::Assigns { is_local, lhs, rhs } => {
+        Stmt::Binding { lhs, rhs } => {
             for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
-                let val: Value<'a> = eval_expr(ctx, rhs)?;
+                let val = eval_expr(ctx, rhs)?.unwrap();
                 ctx.set(lhs, val, lhs.span)?;
             }
         }
-        Stmt::Assign { lhs, rhs } => todo!(),
+        Stmt::Assign { lhs, rhs } => {
+            for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
+                let val = eval_expr(ctx, rhs)?;
+                todo!()
+            }
+        }
         Stmt::If {
             condition,
             then_block,
             else_if_blocks,
             else_block,
         } => {
-            if eval_expr(ctx, condition)?.truthy() {
+            if eval_expr(ctx, condition)?.unwrap().truthy() {
                 ctx.push();
                 eval_stmts(ctx, then_block)?;
                 ctx.pop();
                 return Ok(());
             }
             for (condition, then_block) in else_if_blocks {
-                if eval_expr(ctx, condition)?.truthy() {
+                if eval_expr(ctx, condition)?.unwrap().truthy() {
                     ctx.push();
                     eval_stmts(ctx, then_block)?;
                     ctx.pop();
@@ -318,11 +346,11 @@ fn func_call<'a>(
     ctx: &mut Context<'a>,
     name: &Spanned<String>,
     args: &Spanned<Vec<Spanned<Expr>>>,
-) -> Result<Value<'a>, Error> {
+) -> Result<Option<Value<'a>>, Error<'a>> {
     let args = args
         .iter()
-        .map(|arg| eval_expr(ctx, arg))
-        .collect::<Result<Vec<_>, Error>>()?;
+        .map(|arg| eval_expr(ctx, arg).map(|v| v.unwrap()))
+        .collect::<Result<Vec<_>, _>>()?;
     match ctx.get(name, name.span)? {
         Value::Func(func_body) => inner_func_call(ctx, func_body, args),
         Value::FFI(f) => f(ctx, name.span, args),
@@ -336,25 +364,29 @@ pub fn inner_func_call<'a>(
     ctx: &mut Context<'a>,
     func_body: &'a FuncBody,
     args: Vec<Value<'a>>,
-) -> Result<Value<'a>, Error> {
+) -> Result<Option<Value<'a>>, Error<'a>> {
     let mut scope = Scope::default();
-    for (binding, val) in func_body.args.iter().zip(args) {
-        scope.insert(binding, val);
+    for (arg, val) in func_body.args.iter().zip(args) {
+        scope.insert(arg.name.as_str(), val);
     }
     ctx.scopes.push(scope);
     eval_stmts(ctx, &func_body.body)?;
-    Ok(Value::Nil)
+    ctx.pop();
+    Ok(None)
 }
 
-fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &Spanned<Expr>) -> Result<Value<'a>, Error> {
-    match &expr.data {
-        Expr::Nil => Ok(Value::Nil),
-        Expr::True => Ok(Value::Boolean(true)),
-        Expr::False => Ok(Value::Boolean(false)),
-        Expr::Float(val) => Ok(Value::Float(*val)),
-        Expr::Integer(val) => Ok(Value::Integer(*val)),
-        Expr::String(val) => Ok(Value::String(Rc::from(val.to_owned()))),
-        Expr::Identifier(ident) => ctx.get(ident, expr.span),
+fn eval_expr<'a>(
+    ctx: &mut Context<'a>,
+    expr: &Spanned<Expr>,
+) -> Result<Option<Value<'a>>, Error<'a>> {
+    let val = match &expr.data {
+        Expr::Nil => Value::Nil,
+        Expr::True => Value::Boolean(true),
+        Expr::False => Value::Boolean(false),
+        Expr::Float(val) => Value::Float(*val),
+        Expr::Integer(val) => Value::Integer(*val),
+        Expr::String(val) => Value::String(Rc::from(val.to_owned())),
+        Expr::Identifier(ident) => ctx.get(ident, expr.span)?,
         Expr::Table { elements } => {
             let mut named = HashMap::new();
             let mut indexed = BTreeMap::new();
@@ -362,30 +394,29 @@ fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &Spanned<Expr>) -> Result<Value<'a
             for e in elements {
                 match &e.data {
                     Element::Indexed(expr) => {
-                        indexed.insert(index, eval_expr(ctx, expr)?);
+                        indexed.insert(index, eval_expr(ctx, expr)?.unwrap());
                         index += 1;
                     }
                     Element::Named { name, expr } => {
-                        named.insert(Rc::from(name.to_string()), eval_expr(ctx, expr)?);
+                        named.insert(Rc::from(name.to_string()), eval_expr(ctx, expr)?.unwrap());
                     }
                 }
             }
-            Ok(Value::Table(Rc::new(Table { named, indexed })))
+            Value::Table(Rc::new(Table { named, indexed }))
         }
         Expr::UnOp { val, op } => {
-            let val = eval_expr(ctx, val)?;
-            let res = match (op.data, val) {
+            let val = eval_expr(ctx, val)?.unwrap();
+            match (op.data, val) {
                 (UnOp::Neg, Value::Float(val)) => Value::Float(-val),
                 (UnOp::Neg, Value::Integer(val)) => Value::Integer(-val),
                 (UnOp::Not, Value::Boolean(val)) => Value::Boolean(!val),
                 (op, val) => todo!("{op:?} {val:?}"),
-            };
-            Ok(res)
+            }
         }
         Expr::Member { val, member } => {
             let span = val.span;
-            let val = eval_expr(ctx, val)?;
-            let res = match val {
+            let val = eval_expr(ctx, val)?.unwrap();
+            match val {
                 Value::Table(t) => t.named.get(member.as_str()).cloned().unwrap_or(Value::Nil),
                 _ => {
                     return Err(Error::TypeMismatch {
@@ -394,13 +425,12 @@ fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &Spanned<Expr>) -> Result<Value<'a
                         span,
                     });
                 }
-            };
-            Ok(res)
+            }
         }
         Expr::BinOp { rhs, lhs, op } => {
-            let rhs = eval_expr(ctx, rhs)?;
-            let lhs = eval_expr(ctx, lhs)?;
-            let res = match (op.data, lhs, rhs) {
+            let rhs = eval_expr(ctx, rhs)?.unwrap();
+            let lhs = eval_expr(ctx, lhs)?.unwrap();
+            match (op.data, lhs, rhs) {
                 (BinOp::Add, Value::String(l), Value::String(r)) => {
                     Value::String(Rc::from(format!("{l}{r}")))
                 }
@@ -462,11 +492,11 @@ fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &Spanned<Expr>) -> Result<Value<'a
                     }
                 }
                 (op, l, r) => todo!("{op:?} {l:?} {r:?}"),
-            };
-            Ok(res)
+            }
         }
         Expr::TypeConstructor { name, fields } => todo!(),
-        Expr::Call { name, args } => func_call(ctx, name, args),
+        Expr::Call { name, args } => return func_call(ctx, name, args),
         Expr::Func { body } => todo!(),
-    }
+    };
+    Ok(Some(val))
 }

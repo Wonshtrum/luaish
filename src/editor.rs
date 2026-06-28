@@ -26,6 +26,8 @@ use crate::source::{Source, Span, Spanned};
 
 fn token_color(kind: &Token) -> Color {
     match kind {
+        Token::Comment => Color::Cyan,
+
         // Literals
         Token::Nil
         | Token::True
@@ -69,7 +71,7 @@ fn token_color(kind: &Token) -> Color {
         | Token::GT
         | Token::LT
         | Token::GE
-        | Token::LE => Color::DarkCyan,
+        | Token::LE => Color::DarkGreen,
 
         _ => Color::AnsiValue(236),
     }
@@ -1177,7 +1179,13 @@ fn visit_stmt(stmt: &Spanned<Stmt>, cursor: usize, path: &mut Vec<AstNode>) {
     });
     match &stmt.data {
         Stmt::Break => {}
-        Stmt::Return { values } => visit_exprs(values, cursor, path),
+        Stmt::Return { expr } => {
+            if let Some(expr) = expr {
+                if expr.contains(cursor) {
+                    visit_expr(expr, cursor, path)
+                }
+            }
+        }
         Stmt::Call { name, args } => {
             if name.contains(cursor) {
                 path.push(AstNode {
@@ -1191,7 +1199,7 @@ fn visit_stmt(stmt: &Spanned<Stmt>, cursor: usize, path: &mut Vec<AstNode>) {
                 visit_exprs(args, cursor, path);
             }
         }
-        Stmt::Assigns { is_local, lhs, rhs } => {
+        Stmt::Binding { lhs, rhs } => {
             if lhs.contains(cursor) {
                 visit_idents(lhs, cursor, path);
                 return;
@@ -1202,11 +1210,11 @@ fn visit_stmt(stmt: &Spanned<Stmt>, cursor: usize, path: &mut Vec<AstNode>) {
         }
         Stmt::Assign { lhs, rhs } => {
             if lhs.contains(cursor) {
-                visit_expr(lhs, cursor, path);
+                visit_exprs(lhs, cursor, path);
                 return;
             }
             if rhs.contains(cursor) {
-                visit_expr(rhs, cursor, path);
+                visit_exprs(rhs, cursor, path);
             }
         }
         Stmt::ForNum {
@@ -1407,6 +1415,7 @@ fn visit_expr(expr: &Spanned<Expr>, cursor: usize, path: &mut Vec<AstNode>) {
                                         span: expr.span,
                                         weak: true,
                                     });
+                                    visit_expr(expr, cursor, path);
                                     return;
                                 }
                             }

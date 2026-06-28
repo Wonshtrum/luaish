@@ -333,7 +333,7 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Context<'a>, Error> {
     log!("{ctx:#?}");
 
     for stmt in stmts {
-        eval_stmt(&mut ctx, stmt)?;
+        eval_stmt(&mut ctx, stmt, None)?;
     }
 
     Ok(ctx)
@@ -367,16 +367,17 @@ fn eval_call<'a>(
 fn eval_func<'a>(ctx: &mut Context<'a>, body: &'a FuncBody) -> Result<NType, Error> {
     let mut scope = Scope::default();
     let mut args = Vec::with_capacity(body.args.len());
-    for arg in &body.args {
-        let typ = NType {
-            nesting: 0,
-            inner: Type::String,
-        };
+    for arg in &body.args.data {
+        let typ = process_type(&mut ctx.names, &arg.typ);
         args.push(typ.clone());
-        scope.insert(arg.as_str(), typ);
+        scope.insert(arg.name.as_str(), typ);
     }
+    let ret = body
+        .ret
+        .as_ref()
+        .map(|typ| typ.span.attach(process_type(&mut ctx.names, typ)));
     ctx.scopes.push(scope);
-    eval_stmts(ctx, &body.body)?;
+    eval_stmts(ctx, &body.body, ret.as_ref())?;
     ctx.pop();
     Ok(NType {
         nesting: 0,
@@ -384,28 +385,74 @@ fn eval_func<'a>(ctx: &mut Context<'a>, body: &'a FuncBody) -> Result<NType, Err
     })
 }
 
-pub fn eval_stmts<'a>(ctx: &mut Context<'a>, stmts: &'a [Spanned<Stmt>]) -> Result<(), Error> {
+pub fn eval_stmts<'a>(
+    ctx: &mut Context<'a>,
+    stmts: &'a [Spanned<Stmt>],
+    ret: Option<&Spanned<NType>>,
+) -> Result<(), Error> {
     for stmt in stmts {
-        eval_stmt(ctx, stmt)?;
+        eval_stmt(ctx, stmt, ret)?;
     }
     Ok(())
 }
 
-pub fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), Error> {
+pub fn eval_stmt<'a>(
+    ctx: &mut Context<'a>,
+    stmt: &'a Spanned<Stmt>,
+    ret: Option<&Spanned<NType>>,
+) -> Result<(), Error> {
     match &stmt.data {
         Stmt::TypeDef { .. } => {}
         Stmt::Break => {}
-        Stmt::Return { values } => todo!(),
+        Stmt::Return { expr } => {
+            let typ = if let Some(expr) = expr {
+                eval_expr(ctx, expr)?.map(|typ| (typ, expr.span))
+            } else {
+                None
+            };
+            match (typ, ret) {
+                (None, None) => {}
+                (Some((typ, span)), Some(ret)) => {
+                    if !ret.can_coerce(&typ) {
+                        return Err(Error::Mismatch {
+                            expected: ret.data.to_owned(),
+                            found: typ,
+                            span,
+                        });
+                    }
+                }
+                (Some((typ, span)), None) => {
+                    return Err(todo!());
+                }
+                (None, Some(ret)) => {
+                    return Err(todo!());
+                }
+            }
+        }
         Stmt::Call { name, args } => {
             eval_call(ctx, name, args)?;
         }
-        Stmt::Assigns { is_local, lhs, rhs } => {
+        Stmt::Binding { lhs, rhs } => {
             for (l, r) in lhs.iter().zip(rhs.iter()) {
                 let typ = eval_expr(ctx, r)?.unwrap();
-                ctx.set(*is_local, l, typ, l.span)?;
+                ctx.set(true, l, typ, l.span)?;
             }
         }
-        Stmt::Assign { lhs, rhs } => todo!(),
+        Stmt::Assign { lhs, rhs } => {
+            log!("{lhs:#?}");
+            log!("{rhs:#?}");
+            for (l, r) in lhs.iter().zip(rhs.iter()) {
+                let ltyp = eval_expr(ctx, l)?.unwrap();
+                let rtyp = eval_expr(ctx, r)?.unwrap();
+                if !ltyp.can_coerce(&rtyp) {
+                    return Err(Error::Mismatch {
+                        expected: ltyp,
+                        found: rtyp,
+                        span: r.span,
+                    });
+                }
+            }
+        }
         Stmt::If {
             condition,
             then_block,
@@ -418,7 +465,7 @@ pub fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(
                     panic!("expected boolean");
                 }
                 ctx.push();
-                eval_stmts(ctx, then_block)?;
+                eval_stmts(ctx, then_block, ret)?;
                 ctx.pop();
             }
             for (condition, then_block) in else_if_blocks {
@@ -427,12 +474,12 @@ pub fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(
                     panic!("expected boolean");
                 }
                 ctx.push();
-                eval_stmts(ctx, then_block)?;
+                eval_stmts(ctx, then_block, ret)?;
                 ctx.pop();
             }
             if let Some(else_block) = else_block {
                 ctx.push();
-                eval_stmts(ctx, else_block)?;
+                eval_stmts(ctx, else_block, ret)?;
                 ctx.pop();
             }
         }
@@ -466,7 +513,9 @@ pub fn eval_expr<'a>(
         Expr::Float(_) => Type::Float,
         Expr::Integer(_) => Type::Integer,
         Expr::String(_) => Type::String,
-        Expr::Identifier(ident) => return ctx.get(ident, expr.span).map(|t| Some(t.to_owned())),
+        Expr::Identifier(ident) => {
+            return ctx.get(ident, expr.span).map(|typ| Some(typ.to_owned()));
+        }
         Expr::UnOp { val, op } => {
             let typ = eval_expr(ctx, val)?.unwrap();
             match (op.data, typ) {

@@ -1,6 +1,6 @@
 use std::fmt::{self, Debug};
 
-use crate::ast::{BinOp, Element, Expr, FieldConstructor, FieldDef, FuncBody, Stmt, Type, UnOp};
+use crate::ast::{ArgDef, BinOp, Element, Expr, FieldConstructor, FuncBody, Stmt, Type, UnOp};
 use crate::lexer::Token;
 use crate::source::{Source, Span, Spanned};
 
@@ -57,6 +57,15 @@ impl Error {
     }
 }
 
+impl Expr {
+    fn is_lvalue(&self) -> bool {
+        match self {
+            Expr::Identifier(_) | Expr::Member { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(PartialOrd, Ord, PartialEq, Eq)]
 enum Precedence {
@@ -86,10 +95,14 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     pub fn new(source: &'a Source, tokens: Vec<Spanned<Token>>) -> Parser<'a> {
         let eof = tokens.last().unwrap().clone();
+        let mut pos = 0;
+        while pos < tokens.len() && tokens[pos].same_kind_as(&Token::Comment) {
+            pos += 1;
+        }
         Parser {
             source,
             tokens,
-            pos: 0,
+            pos,
             eof,
         }
     }
@@ -98,13 +111,31 @@ impl<'a> Parser<'a> {
         self.tokens.get(self.pos).unwrap_or(&self.eof)
     }
 
-    fn peek(&self, n: usize) -> &Spanned<Token> {
-        self.tokens.get(self.pos + n).unwrap_or(&self.eof)
+    fn peek(&self, mut n: usize) -> &Spanned<Token> {
+        let mut i = 0;
+        loop {
+            let Some(token) = self.tokens.get(self.pos + i) else {
+                return &self.eof;
+            };
+            if n == 0 {
+                return token;
+            }
+            if !token.same_kind_as(&Token::Comment) {
+                n -= 1;
+            }
+            i += 1;
+        }
     }
 
     fn advance(&mut self) {
-        if self.pos < self.tokens.len() {
+        loop {
             self.pos += 1;
+            let Some(token) = self.tokens.get(self.pos) else {
+                return;
+            };
+            if !token.same_kind_as(&Token::Comment) {
+                return;
+            }
         }
     }
 
@@ -244,11 +275,21 @@ impl<'a> Parser<'a> {
                     return Err(expected_local());
                 }
                 self.advance();
-                let expr = self.parse_expr()?;
-                let values = span.merge(expr.span).attach(vec![expr]);
-                span.attach(Stmt::Return { values })
+                match &self.current().data {
+                    Token::End | Token::ElseIf | Token::Else => {
+                        span.attach(Stmt::Return { expr: None })
+                    }
+                    _ => {
+                        let expr = self.parse_expr()?;
+                        span.merge(expr.span)
+                            .attach(Stmt::Return { expr: Some(expr) })
+                    }
+                }
             }
             Token::Struct => {
+                if is_local {
+                    return Err(expected_local());
+                }
                 self.advance();
                 let name = self.expect_identifier(Some("type name"))?;
                 let mut fields = Vec::new();
@@ -259,7 +300,7 @@ impl<'a> Parser<'a> {
                     self.expect(Token::Colon, None, None)?;
                     let typ = self.expect_type(Some("field type"))?;
                     field_end = typ.span;
-                    fields.push(name.span.merge(typ.span).attach(FieldDef { name, typ }));
+                    fields.push(name.span.merge(typ.span).attach(ArgDef { name, typ }));
                 }
                 let fields = field_start.merge(field_end).attach(fields);
                 let last_span = self.current().span;
@@ -270,13 +311,33 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let name = self.expect_identifier(Some("function name"))?;
                 self.expect(Token::LParen, None, None)?;
+                let mut args = Vec::new();
+                let args_start = self.current().span;
+                let mut args_end = args_start;
+                while !self.current().same_kind_as(&Token::RParen) {
+                    let name = self.expect_identifier(Some("arg name"))?;
+                    self.expect(Token::Colon, None, None)?;
+                    let typ = self.expect_type(Some("arg type"))?;
+                    args_end = typ.span;
+                    args.push(name.span.merge(typ.span).attach(ArgDef { name, typ }));
+                }
+                let args = args_start.merge(args_end).attach(args);
+                let last_span = self.current().span;
                 self.expect(Token::RParen, None, None)?;
+                let ret = if self.current().same_kind_as(&Token::Colon) {
+                    self.advance();
+                    let typ = self.expect_type(Some("return type"))?;
+                    Some(typ)
+                } else {
+                    None
+                };
+
                 let body = self.parse_block()?;
                 let end = self.expect(Token::End, None, None)?;
                 span.merge(end).attach(Stmt::FuncDef {
                     is_local,
                     name,
-                    body: FuncBody { args: vec![], body },
+                    body: FuncBody { args, ret, body },
                 })
             }
             Token::If => {
@@ -310,35 +371,113 @@ impl<'a> Parser<'a> {
                     else_block,
                 })
             }
-            Token::Identifier(ident) => {
-                let ident = span.attach(ident.to_owned());
-                self.advance();
-                let token = self.current();
+            // Token::Identifier(ident) => {
+            //     let ident = span.attach(ident.to_owned());
+            //     self.advance();
+            //     let token = self.current();
+            //     let lhs_span = span;
+            //     if token.same_kind_as(&Token::LParen) {
+            //         if is_local {
+            //             return Err(Error::Unexpected {
+            //                 message: None,
+            //                 expected: vec![],
+            //                 found: token.to_owned(),
+            //                 started: None,
+            //             });
+            //         }
+            //         self.advance();
+            //         let args = self.parse_expr_list(Token::RParen)?;
+            //         let last_span =
+            //             self.expect(Token::RParen, Some("end of arg list"), Some(span))?;
+            //         return Ok(span
+            //             .merge(last_span)
+            //             .attach(Stmt::Call { name: ident, args }));
+            //     }
+            //     let mut lhs = vec![ident];
+            //     let mut last_span = lhs_span;
+            //     while self.current().same_kind_as(&Token::Comma) {
+            //         self.advance();
+            //         let ident = self.expect_identifier(None)?;
+            //         last_span = ident.span;
+            //         lhs.push(ident);
+            //     }
+            //     self.expect(Token::Assign, None, None)?;
+            //     let lhs = lhs_span.merge(last_span).attach(lhs);
+
+            //     let expr = self.parse_expr()?;
+            //     let rhs_span = expr.span;
+            //     let mut last_span = rhs_span;
+            //     let mut rhs = vec![expr];
+            //     while self.current().same_kind_as(&Token::Comma) {
+            //         self.advance();
+            //         let expr = self.parse_expr()?;
+            //         last_span = expr.span;
+            //         rhs.push(expr);
+            //     }
+            //     let rhs = rhs_span.merge(last_span).attach(rhs);
+
+            //     span.merge(last_span)
+            //         .attach(Stmt::Assigns { is_local, lhs, rhs })
+            // }
+            _ => {
+                if is_local {
+                    let first = self.expect_identifier(None)?;
+                    let start = first.span;
+                    let mut names = vec![first];
+                    let mut end = start;
+                    while self.current().same_kind_as(&Token::Comma) {
+                        self.advance();
+                        let ident = self.expect_identifier(Some("binding name"))?;
+                        end = ident.span;
+                        names.push(ident);
+                    }
+                    self.expect(Token::Assign, None, None)?;
+                    let lhs = start.merge(end).attach(names);
+
+                    let expr = self.parse_expr()?;
+                    let rhs_span = expr.span;
+                    let mut last_span = rhs_span;
+                    let mut rhs = vec![expr];
+                    while self.current().same_kind_as(&Token::Comma) {
+                        self.advance();
+                        let expr = self.parse_expr()?;
+                        last_span = expr.span;
+                        rhs.push(expr);
+                    }
+                    let rhs = rhs_span.merge(last_span).attach(rhs);
+                    return Ok(span.merge(rhs.span).attach(Stmt::Binding { lhs, rhs }));
+                }
+
+                let expr = self.parse_expr()?;
+                if let Expr::Call { name, args } = expr.data {
+                    return Ok(expr.span.attach(Stmt::Call { name, args }));
+                }
+
+                if !expr.is_lvalue() {
+                    return Err(Error::Unexpected {
+                        message: Some("lvalue or function call"),
+                        expected: vec![],
+                        found: self.current().to_owned(),
+                        started: None,
+                    });
+                }
+
                 let lhs_span = span;
-                if token.same_kind_as(&Token::LParen) {
-                    if is_local {
+                let mut last_span = span;
+                let mut lhs = vec![expr];
+                while self.current().same_kind_as(&Token::Comma) {
+                    self.advance();
+                    let expr = self.parse_expr()?;
+                    if !expr.is_lvalue() {
                         return Err(Error::Unexpected {
-                            message: None,
+                            message: Some("lvalue"),
                             expected: vec![],
-                            found: token.to_owned(),
+                            found: self.current().to_owned(),
                             started: None,
                         });
                     }
-                    self.advance();
-                    let args = self.parse_expr_list(Token::RParen)?;
-                    let last_span =
-                        self.expect(Token::RParen, Some("end of arg list"), Some(span))?;
-                    return Ok(span
-                        .merge(last_span)
-                        .attach(Stmt::Call { name: ident, args }));
-                }
-                let mut lhs = vec![ident];
-                let mut last_span = lhs_span;
-                while self.current().same_kind_as(&Token::Comma) {
-                    self.advance();
-                    let ident = self.expect_identifier(None)?;
-                    last_span = ident.span;
-                    lhs.push(ident);
+                    last_span = expr.span;
+                    lhs.push(expr);
                 }
                 self.expect(Token::Assign, None, None)?;
                 let lhs = lhs_span.merge(last_span).attach(lhs);
@@ -355,16 +494,7 @@ impl<'a> Parser<'a> {
                 }
                 let rhs = rhs_span.merge(last_span).attach(rhs);
 
-                span.merge(last_span)
-                    .attach(Stmt::Assigns { is_local, lhs, rhs })
-            }
-            _ => {
-                return Err(Error::Unexpected {
-                    message: Some("TODO"),
-                    expected: vec![],
-                    found: self.current().to_owned(),
-                    started: None,
-                });
+                span.merge(last_span).attach(Stmt::Assign { lhs, rhs })
             }
         };
         Ok(expr)

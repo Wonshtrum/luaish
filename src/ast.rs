@@ -48,7 +48,7 @@ pub enum Element {
 }
 
 #[derive(Debug, Clone)]
-pub struct FieldDef {
+pub struct ArgDef {
     pub name: Spanned<String>,
     pub typ: Spanned<Type>,
 }
@@ -122,7 +122,8 @@ pub type Block = Vec<Spanned<Stmt>>;
 
 #[derive(Debug, Clone)]
 pub struct FuncBody {
-    pub args: Vec<Spanned<String>>,
+    pub args: Spanned<Vec<Spanned<ArgDef>>>,
+    pub ret: Option<Spanned<Type>>,
     pub body: Spanned<Block>,
 }
 
@@ -130,7 +131,7 @@ pub struct FuncBody {
 pub enum Stmt {
     Break,
     Return {
-        values: Spanned<Vec<Spanned<Expr>>>,
+        expr: Option<Spanned<Expr>>,
     },
 
     Call {
@@ -138,15 +139,14 @@ pub enum Stmt {
         args: Spanned<Vec<Spanned<Expr>>>,
     },
 
-    Assigns {
-        is_local: bool,
+    Binding {
         lhs: Spanned<Vec<Spanned<String>>>,
         rhs: Spanned<Vec<Spanned<Expr>>>,
     },
 
     Assign {
-        lhs: Spanned<Expr>,
-        rhs: Spanned<Expr>,
+        lhs: Spanned<Vec<Spanned<Expr>>>,
+        rhs: Spanned<Vec<Spanned<Expr>>>,
     },
 
     If {
@@ -166,7 +166,7 @@ pub enum Stmt {
 
     TypeDef {
         name: Spanned<String>,
-        fields: Spanned<Vec<Spanned<FieldDef>>>,
+        fields: Spanned<Vec<Spanned<ArgDef>>>,
     },
 
     FuncDef {
@@ -207,7 +207,8 @@ impl Stmt {
             Self::Break => "Break",
             Self::Return { .. } => "Return",
             Self::Call { .. } => "FunctionCall",
-            Self::Assign { .. } | Self::Assigns { .. } => "Assign",
+            Self::Assign { .. } => "Assign",
+            Self::Binding { .. } => "Binding",
             Self::If { .. } => "If/Else",
             Self::ForNum { .. } => "NumericFor",
             Self::FuncDef { .. } => "FunctionDef",

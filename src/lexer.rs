@@ -23,6 +23,9 @@ impl Error {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
+    // only for highlighting
+    Comment,
+
     // Keywords
     Break,
     For,
@@ -210,7 +213,6 @@ impl<'a> Lexer<'a> {
             Some('/') => {
                 self.advance();
                 if self.current() == Some('/') {
-                    // skip comment
                     self.advance();
                     while let Some(c) = self.current() {
                         if c == '\n' {
@@ -218,9 +220,10 @@ impl<'a> Lexer<'a> {
                         }
                         self.advance();
                     }
-                    return self.next_token();
+                    Token::Comment
+                } else {
+                    Token::Divide
                 }
-                Token::Divide
             }
             Some('=') => {
                 self.advance();
