@@ -7,6 +7,9 @@ use crate::source::{Source, Span, Spanned};
 
 #[derive(Debug)]
 pub enum Error {
+    MissingTypeDefinition {
+        name: String,
+    },
     Unbound {
         ident: String,
         span: Span,
@@ -16,17 +19,63 @@ pub enum Error {
         found: NType,
         span: Span,
     },
+    ExpectedFunction {
+        found: NType,
+        span: Span,
+    },
     UnexpectedField {
         ident: String,
+        span: Span,
+    },
+    InvalidTypeForUnOp {
+        op: UnOp,
+        expr: Spanned<NType>,
+    },
+    InvalidTypeForBinOp {
+        op: BinOp,
+        lhs: Spanned<NType>,
+        rhs: Spanned<NType>,
+    },
+    WrongNumberOfElements {
+        expected: usize,
+        found: usize,
         span: Span,
     },
 }
 impl Error {
     pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
         match self {
+            Self::WrongNumberOfElements {
+                expected,
+                found,
+                span,
+            } => {
+                out.write_fmt(format_args!(
+                    "error: expected {expected} elements, but found {found}\n"
+                ))?;
+                source.print_span(*span, out)
+            }
+            Self::MissingTypeDefinition { name } => out.write_fmt(format_args!(
+                "error: missing type definition for `{name}`\n"
+            )),
             Self::Unbound { ident, span } => {
                 out.write_fmt(format_args!("error: unbound ident `{ident}`\n"))?;
                 source.print_span(*span, out)
+            }
+            Self::InvalidTypeForUnOp { op, expr } => {
+                out.write_fmt(format_args!(
+                    "error: cannot apply `{op:?}` on type `{}`\n",
+                    expr.data
+                ))?;
+                source.print_span(expr.span, out)
+            }
+            Self::InvalidTypeForBinOp { op, rhs, lhs } => {
+                out.write_fmt(format_args!(
+                    "error: cannot apply `{op:?}` between type `{}` and type `{}`\n",
+                    lhs.data, rhs.data
+                ))?;
+                source.print_span(lhs.span, out)?;
+                source.print_span(rhs.span, out)
             }
             Self::Mismatch {
                 expected,
@@ -38,6 +87,10 @@ impl Error {
                 ))?;
                 source.print_span(*span, out)
             }
+            Self::ExpectedFunction { found, span } => {
+                out.write_fmt(format_args!("error: expected function, found `{found}`\n"))?;
+                source.print_span(*span, out)
+            }
             Self::UnexpectedField { ident, span } => {
                 out.write_fmt(format_args!("error: unexpected field `{ident}`\n"))?;
                 source.print_span(*span, out)
@@ -46,7 +99,7 @@ impl Error {
     }
 }
 
-type TypeId = usize;
+pub type TypeId = usize;
 #[derive(Clone, PartialEq, Eq)]
 pub struct NType {
     nesting: usize,
@@ -61,6 +114,7 @@ impl NType {
             return true;
         }
         match (&self.inner, &other.inner) {
+            (Type::String, _) => true,
             (Type::Integer, Type::Float) => true,
             (Type::Float, Type::Integer) => true,
             _ => false,
@@ -142,8 +196,8 @@ impl fmt::Display for Type {
 }
 
 #[derive(Clone)]
-struct StructProto<'a> {
-    fields: Box<[(&'a str, NType)]>,
+pub struct StructProto<'a> {
+    pub fields: Box<[(&'a str, NType)]>,
 }
 impl fmt::Debug for StructProto<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -161,6 +215,13 @@ pub struct Context<'a> {
     names: HashMap<&'a str, TypeId>,
     protos: HashMap<TypeId, StructProto<'a>>,
     scopes: Vec<Scope<'a>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Prototypes<'a> {
+    // pub protos: HashMap<&'a str, StructProto<'a>>,
+    pub offsets: HashMap<(&'a str, &'a str), usize>,
+    pub sizes: HashMap<&'a str, usize>,
 }
 
 impl<'a> Context<'a> {
@@ -244,7 +305,7 @@ fn process_type<'a>(names: &mut HashMap<&'a str, TypeId>, typ: &'a ast::Type) ->
     NType { nesting, inner }
 }
 
-pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Context<'a>, Error> {
+pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
     let mut protos = HashMap::new();
     let mut names = HashMap::new();
     for stmt in stmts {
@@ -336,17 +397,37 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Context<'a>, Error> {
         eval_stmt(&mut ctx, stmt, None)?;
     }
 
-    Ok(ctx)
+    let mut offsets = HashMap::new();
+    let mut sizes = HashMap::new();
+    for (name, tid) in ctx.names {
+        let Some(proto) = ctx.protos.remove(&tid) else {
+            return Err(Error::MissingTypeDefinition {
+                name: name.to_owned(),
+            });
+        };
+        sizes.insert(name, proto.fields.len());
+        for (offset, (member, typ)) in proto.fields.into_iter().enumerate() {
+            offsets.insert((name, member), offset);
+        }
+    }
+    Ok(Prototypes { offsets, sizes })
 }
 
 fn eval_call<'a>(
     ctx: &mut Context<'a>,
-    name: &Spanned<String>,
+    expr: &'a Spanned<Expr>,
     exprs: &'a [Spanned<Expr>],
 ) -> Result<Option<NType>, Error> {
-    let val = ctx.get(name, name.span)?.clone();
-    if val.nesting == 0 {
-        if let Type::Func { args, ret } = val.inner {
+    let typ = eval_expr(ctx, expr)?.unwrap();
+    if typ.nesting == 0 {
+        if let Type::Func { args, ret } = typ.inner {
+            if args.len() != exprs.len() {
+                return Err(Error::WrongNumberOfElements {
+                    expected: args.len(),
+                    found: exprs.len(),
+                    span: expr.span,
+                });
+            }
             for (arg_typ, expr) in args.into_iter().zip(exprs.iter()) {
                 let typ = eval_expr(ctx, expr)?.unwrap();
                 if !arg_typ.can_coerce(&typ) {
@@ -361,7 +442,10 @@ fn eval_call<'a>(
             return Ok(ret);
         }
     };
-    panic!("expected function")
+    Err(Error::ExpectedFunction {
+        found: typ,
+        span: expr.span,
+    })
 }
 
 fn eval_func<'a>(ctx: &mut Context<'a>, body: &'a FuncBody) -> Result<NType, Error> {
@@ -379,9 +463,10 @@ fn eval_func<'a>(ctx: &mut Context<'a>, body: &'a FuncBody) -> Result<NType, Err
     ctx.scopes.push(scope);
     eval_stmts(ctx, &body.body, ret.as_ref())?;
     ctx.pop();
+    let ret = ret.map(|typ| Box::new(typ.data));
     Ok(NType {
         nesting: 0,
-        inner: Type::Func { args, ret: None },
+        inner: Type::Func { args, ret },
     })
 }
 
@@ -429,18 +514,30 @@ pub fn eval_stmt<'a>(
                 }
             }
         }
-        Stmt::Call { name, args } => {
-            eval_call(ctx, name, args)?;
+        Stmt::Call { expr, args } => {
+            eval_call(ctx, expr, args)?;
         }
         Stmt::Binding { lhs, rhs } => {
+            if lhs.len() != rhs.len() {
+                return Err(Error::WrongNumberOfElements {
+                    expected: lhs.len(),
+                    found: rhs.len(),
+                    span: lhs.span,
+                });
+            }
             for (l, r) in lhs.iter().zip(rhs.iter()) {
                 let typ = eval_expr(ctx, r)?.unwrap();
                 ctx.set(true, l, typ, l.span)?;
             }
         }
         Stmt::Assign { lhs, rhs } => {
-            log!("{lhs:#?}");
-            log!("{rhs:#?}");
+            if lhs.len() != rhs.len() {
+                return Err(Error::WrongNumberOfElements {
+                    expected: lhs.len(),
+                    found: rhs.len(),
+                    span: lhs.span,
+                });
+            }
             for (l, r) in lhs.iter().zip(rhs.iter()) {
                 let ltyp = eval_expr(ctx, l)?.unwrap();
                 let rtyp = eval_expr(ctx, r)?.unwrap();
@@ -462,7 +559,11 @@ pub fn eval_stmt<'a>(
             {
                 let typ = eval_expr(ctx, condition)?.unwrap();
                 if typ != BOOLEAN {
-                    panic!("expected boolean");
+                    return Err(Error::Mismatch {
+                        expected: BOOLEAN,
+                        found: typ,
+                        span: condition.span,
+                    });
                 }
                 ctx.push();
                 eval_stmts(ctx, then_block, ret)?;
@@ -471,7 +572,11 @@ pub fn eval_stmt<'a>(
             for (condition, then_block) in else_if_blocks {
                 let typ = eval_expr(ctx, condition)?.unwrap();
                 if typ != BOOLEAN {
-                    panic!("expected boolean");
+                    return Err(Error::Mismatch {
+                        expected: BOOLEAN,
+                        found: typ,
+                        span: condition.span,
+                    });
                 }
                 ctx.push();
                 eval_stmts(ctx, then_block, ret)?;
@@ -513,23 +618,63 @@ pub fn eval_expr<'a>(
         Expr::Float(_) => Type::Float,
         Expr::Integer(_) => Type::Integer,
         Expr::String(_) => Type::String,
+        Expr::List { elements } => {
+            let Some(base) = elements.first() else {
+                return todo!();
+            };
+            let mut base_typ = eval_expr(ctx, base)?.unwrap();
+            for e in &elements.data[1..] {
+                let typ = eval_expr(ctx, e)?.unwrap();
+                if base_typ != typ {
+                    return Err(Error::Mismatch {
+                        expected: base_typ,
+                        found: typ,
+                        span: e.span,
+                    });
+                }
+            }
+            base_typ.nesting += 1;
+            return Ok(Some(base_typ));
+        }
         Expr::Identifier(ident) => {
             return ctx.get(ident, expr.span).map(|typ| Some(typ.to_owned()));
         }
-        Expr::UnOp { val, op } => {
-            let typ = eval_expr(ctx, val)?.unwrap();
+        Expr::UnOp { expr, op } => {
+            let typ = eval_expr(ctx, expr)?.unwrap();
             match (op.data, typ) {
                 (UnOp::Neg, FLOAT) => Type::Float,
                 (UnOp::Neg, INTEGER) => Type::Integer,
                 (UnOp::Not, BOOLEAN) => Type::Boolean,
-                (op, val) => todo!("{op:?} {val:?}"),
+                (op, typ) => {
+                    return Err(Error::InvalidTypeForUnOp {
+                        op,
+                        expr: expr.span.attach(typ),
+                    });
+                }
             }
         }
         Expr::BinOp { rhs, lhs, op } => {
-            let rhs = eval_expr(ctx, rhs)?.unwrap();
-            let lhs = eval_expr(ctx, lhs)?.unwrap();
-            match (op.data, lhs, rhs) {
-                (BinOp::Add, STRING, STRING) => Type::String,
+            let r = eval_expr(ctx, rhs)?.unwrap();
+            let l = eval_expr(ctx, lhs)?.unwrap();
+            match (op.data, l, r) {
+                (BinOp::Add, STRING, _) => Type::String,
+
+                (
+                    BinOp::Add,
+                    NType {
+                        nesting: ln,
+                        inner: ltyp,
+                    },
+                    NType {
+                        nesting: rn,
+                        inner: rtyp,
+                    },
+                ) if ln == rn && ltyp == rtyp => {
+                    return Ok(Some(NType {
+                        nesting: ln,
+                        inner: ltyp,
+                    }));
+                }
 
                 (BinOp::Add, INTEGER, INTEGER) => Type::Integer,
                 (BinOp::Add, FLOAT, INTEGER) => Type::Float,
@@ -575,12 +720,20 @@ pub fn eval_expr<'a>(
 
                 (BinOp::And, BOOLEAN, BOOLEAN) => Type::Boolean,
                 (BinOp::Or, BOOLEAN, BOOLEAN) => Type::Boolean,
-                (op, l, r) => todo!("{op:?} {l:?} {r:?}"),
+                (op, l, r) => {
+                    return Err(Error::InvalidTypeForBinOp {
+                        op,
+                        lhs: lhs.span.attach(l),
+                        rhs: rhs.span.attach(r),
+                    });
+                }
             }
         }
 
         Expr::Table { elements } => todo!(),
-        Expr::Call { name, args } => return eval_call(ctx, name, args),
+        Expr::Call { expr, args } => {
+            return eval_call(ctx, expr, args);
+        }
         Expr::TypeConstructor { name, fields } => {
             let Some(proto_id) = ctx.names.get(name.as_str()).copied() else {
                 panic!("expected type");
@@ -634,8 +787,8 @@ pub fn eval_expr<'a>(
             Type::Struct(proto_id)
         }
         Expr::Func { body } => eval_func(ctx, body)?.inner,
-        Expr::Member { val, member } => {
-            let typ = eval_expr(ctx, val)?.unwrap();
+        Expr::Member { expr, member } => {
+            let typ = eval_expr(ctx, expr)?.unwrap();
             if typ.nesting != 0 {
                 panic!("expected struct");
             }
@@ -654,6 +807,22 @@ pub fn eval_expr<'a>(
                 ident: member.to_string(),
                 span: member.span,
             });
+        }
+        Expr::Index { expr, index } => {
+            let mut val_typ = eval_expr(ctx, expr)?.unwrap();
+            if val_typ.nesting == 0 {
+                panic!("expected list");
+            }
+            let idx_typ = eval_expr(ctx, index)?.unwrap();
+            if idx_typ != INTEGER {
+                return Err(Error::Mismatch {
+                    expected: INTEGER,
+                    found: idx_typ,
+                    span: index.span,
+                });
+            }
+            val_typ.nesting -= 1;
+            return Ok(Some(val_typ));
         }
     };
     Ok(Some(NType { nesting: 0, inner }))

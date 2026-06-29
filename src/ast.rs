@@ -88,9 +88,12 @@ pub enum Expr {
     Table {
         elements: Vec<Spanned<Element>>,
     },
+    List {
+        elements: Spanned<Vec<Spanned<Expr>>>,
+    },
 
     UnOp {
-        val: Box<Spanned<Expr>>,
+        expr: Box<Spanned<Expr>>,
         op: Spanned<UnOp>,
     },
     BinOp {
@@ -100,7 +103,7 @@ pub enum Expr {
     },
 
     Call {
-        name: Spanned<String>,
+        expr: Box<Spanned<Expr>>,
         args: Spanned<Vec<Spanned<Expr>>>,
     },
     TypeConstructor {
@@ -113,8 +116,12 @@ pub enum Expr {
     },
 
     Member {
-        val: Box<Spanned<Expr>>,
+        expr: Box<Spanned<Expr>>,
         member: Spanned<String>,
+    },
+    Index {
+        expr: Box<Spanned<Expr>>,
+        index: Box<Spanned<Expr>>,
     },
 }
 
@@ -135,7 +142,7 @@ pub enum Stmt {
     },
 
     Call {
-        name: Spanned<String>,
+        expr: Box<Spanned<Expr>>,
         args: Spanned<Vec<Spanned<Expr>>>,
     },
 
@@ -191,10 +198,12 @@ impl Expr {
             Self::String(_) => "String",
             Self::Identifier(_) => "Identifier",
             Self::Table { .. } => "Table",
+            Self::List { .. } => "List",
             Self::UnOp { .. } => "Unary Operation",
             Self::BinOp { .. } => "Binary Operation",
             Self::Member { .. } => "MemberAccess",
-            Self::Call { .. } => "Call",
+            Self::Index { .. } => "IndexAccess",
+            Self::Call { .. } => "FunctionCall",
             Self::TypeConstructor { .. } => "TypeConstructor",
             Expr::Func { .. } => "Lambda",
         }
@@ -229,6 +238,10 @@ impl fmt::Debug for Expr {
             Self::False => f.write_str("False"),
             Self::Float(x) => f.write_fmt(format_args!("Float({x})")),
             Self::Integer(x) => f.write_fmt(format_args!("Integer({x})")),
+            Self::List { elements } => {
+                f.write_str("List")?;
+                f.debug_list().entries(&elements.data).finish()
+            }
             Self::String(x) => f.write_fmt(format_args!("String({x})")),
             Self::Identifier(x) => f.write_fmt(format_args!("Identifier({x:?})")),
             Self::Table { elements } => {
@@ -239,14 +252,19 @@ impl fmt::Debug for Expr {
                 }
                 l.finish()
             }
-            Self::Member { val, member } => f
+            Self::Member { expr, member } => f
                 .debug_struct("MemberAccess")
-                .field("val", val)
+                .field("expr", expr)
                 .field("member", member)
                 .finish(),
-            Self::Call { name, args } => f
+            Self::Index { expr, index } => f
+                .debug_struct("IndexAccess")
+                .field("expr", expr)
+                .field("index", index)
+                .finish(),
+            Self::Call { expr, args } => f
                 .debug_struct("FunctionCall")
-                .field("name", name)
+                .field("expr", expr)
                 .field("args", args)
                 .finish(),
             Self::TypeConstructor { name, fields } => f
@@ -254,10 +272,10 @@ impl fmt::Debug for Expr {
                 .field("name", name)
                 .field("fields", fields)
                 .finish(),
-            Self::UnOp { val, op } => f
+            Self::UnOp { expr, op } => f
                 .debug_struct("UnOp")
                 .field("op", op)
-                .field("val", val)
+                .field("expr", expr)
                 .finish(),
             Self::BinOp { rhs, lhs, op } => f
                 .debug_struct("BinOp")

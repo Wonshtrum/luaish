@@ -304,10 +304,10 @@ struct TextPane {
     base: BasePane,
     version: u64,
     source: Source,
-    generate: fn(&EditorContext) -> String,
+    generate: fn(&mut EditorContext) -> String,
 }
 impl TextPane {
-    fn new(label: &'static str, generate: fn(&EditorContext) -> String) -> Self {
+    fn new(label: &'static str, generate: fn(&mut EditorContext) -> String) -> Self {
         Self {
             label,
             base: BasePane::new(),
@@ -419,14 +419,24 @@ impl Editor {
                 })),
                 Box::new(TextPane::new("Exec", |ctx| match &ctx.output.result {
                     Err(error) | Ok((_, Err(error))) => error.clone(),
-                    Ok((_tokens, Ok((ast, _)))) => match interpreter::run(ast) {
-                        Ok(res) => res,
-                        Err(error) => {
-                            let mut out = String::new();
-                            let _ = error.pretty_print(&ctx.source, &mut out);
-                            out
+                    Ok((_tokens, Ok((ast, _)))) => {
+                        let protos = match resolution::run(ast) {
+                            Ok(env) => env,
+                            Err(error) => {
+                                let mut out = String::new();
+                                let _ = error.pretty_print(&ctx.source, &mut out);
+                                return out;
+                            }
+                        };
+                        match interpreter::run(protos, ast) {
+                            Ok(res) => res,
+                            Err(error) => {
+                                let mut out = String::new();
+                                let _ = error.pretty_print(&ctx.source, &mut out);
+                                out
+                            }
                         }
-                    },
+                    }
                 })),
             ],
             active: 0,
@@ -1186,13 +1196,9 @@ fn visit_stmt(stmt: &Spanned<Stmt>, cursor: usize, path: &mut Vec<AstNode>) {
                 }
             }
         }
-        Stmt::Call { name, args } => {
-            if name.contains(cursor) {
-                path.push(AstNode {
-                    label: "FunctionName",
-                    span: name.span,
-                    weak: true,
-                });
+        Stmt::Call { expr, args } => {
+            if expr.contains(cursor) {
+                visit_expr(expr, cursor, path);
                 return;
             }
             if args.contains(cursor) {
@@ -1342,6 +1348,11 @@ fn visit_expr(expr: &Spanned<Expr>, cursor: usize, path: &mut Vec<AstNode>) {
         | Expr::Integer(_)
         | Expr::String(_)
         | Expr::Identifier(_) => {}
+        Expr::List { elements } => {
+            if elements.contains(cursor) {
+                visit_exprs(elements, cursor, path);
+            }
+        }
         Expr::Table { elements } => {
             for e in elements {
                 if e.contains(cursor) {
@@ -1425,22 +1436,18 @@ fn visit_expr(expr: &Spanned<Expr>, cursor: usize, path: &mut Vec<AstNode>) {
                 }
             }
         }
-        Expr::Call { name, args } => {
-            if name.contains(cursor) {
-                path.push(AstNode {
-                    label: "FunctionName",
-                    span: name.span,
-                    weak: true,
-                });
+        Expr::Call { expr, args } => {
+            if expr.contains(cursor) {
+                visit_expr(expr, cursor, path);
                 return;
             }
             if args.contains(cursor) {
                 visit_exprs(args, cursor, path);
             }
         }
-        Expr::Member { val, member } => {
-            if val.contains(cursor) {
-                visit_expr(val, cursor, path);
+        Expr::Member { expr, member } => {
+            if expr.contains(cursor) {
+                visit_expr(expr, cursor, path);
                 return;
             }
             if member.contains(cursor) {
@@ -1451,9 +1458,23 @@ fn visit_expr(expr: &Spanned<Expr>, cursor: usize, path: &mut Vec<AstNode>) {
                 });
             }
         }
-        Expr::UnOp { val, .. } => {
-            if val.contains(cursor) {
-                visit_expr(val, cursor, path)
+        Expr::Index { expr, index } => {
+            if expr.contains(cursor) {
+                visit_expr(expr, cursor, path);
+                return;
+            }
+            if index.contains(cursor) {
+                path.push(AstNode {
+                    label: "Index",
+                    span: index.span,
+                    weak: true,
+                });
+                visit_expr(index, cursor, path);
+            }
+        }
+        Expr::UnOp { expr, .. } => {
+            if expr.contains(cursor) {
+                visit_expr(expr, cursor, path)
             }
         }
         Expr::BinOp { rhs, lhs, .. } => {

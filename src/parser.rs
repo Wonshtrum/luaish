@@ -60,7 +60,7 @@ impl Error {
 impl Expr {
     fn is_lvalue(&self) -> bool {
         match self {
-            Expr::Identifier(_) | Expr::Member { .. } => true,
+            Expr::Identifier(_) | Expr::Member { .. } | Expr::Index { .. } => true,
             _ => false,
         }
     }
@@ -449,8 +449,9 @@ impl<'a> Parser<'a> {
                 }
 
                 let expr = self.parse_expr()?;
-                if let Expr::Call { name, args } = expr.data {
-                    return Ok(expr.span.attach(Stmt::Call { name, args }));
+                let lhs_span = expr.span;
+                if let Expr::Call { expr, args } = expr.data {
+                    return Ok(lhs_span.attach(Stmt::Call { expr, args }));
                 }
 
                 if !expr.is_lvalue() {
@@ -462,7 +463,6 @@ impl<'a> Parser<'a> {
                     });
                 }
 
-                let lhs_span = span;
                 let mut last_span = span;
                 let mut lhs = vec![expr];
                 while self.current().same_kind_as(&Token::Comma) {
@@ -564,15 +564,36 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let member = self.expect_identifier(Some("member"))?;
                 let expr = lhs.span.merge(member.span).attach(Expr::Member {
-                    val: Box::new(lhs),
+                    expr: Box::new(lhs),
                     member,
                 });
                 return Ok(expr);
             }
-            Token::LParen => todo!("method call"),
-            Token::LBracket => todo!("indexing"),
-            Token::LBrace => todo!("struct"),
-            _ => panic!(),
+            Token::LParen => {
+                let span = token.span;
+                self.advance();
+                let args = self.parse_expr_list(Token::RParen)?;
+                let last_span =
+                    self.expect(Token::RParen, Some("end of function call"), Some(span))?;
+                let expr = lhs.span.merge(last_span).attach(Expr::Call {
+                    expr: Box::new(lhs),
+                    args,
+                });
+                return Ok(expr);
+            }
+            Token::LBracket => {
+                let span = token.span;
+                self.advance();
+                let index = self.parse_expr()?;
+                let last_span =
+                    self.expect(Token::RBracket, Some("end of indexing"), Some(span))?;
+                let expr = lhs.span.merge(last_span).attach(Expr::Index {
+                    expr: Box::new(lhs),
+                    index: Box::new(index),
+                });
+                return Ok(expr);
+            }
+            _ => unreachable!(),
         };
         let op = token.span.attach(op);
         self.advance();
@@ -618,7 +639,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let expr = self.parse_expr_inner(Precedence::Unary as usize)?;
                 span.merge(expr.span).attach(Expr::UnOp {
-                    val: Box::new(expr),
+                    expr: Box::new(expr),
                     op: span.attach(UnOp::Neg),
                 })
             }
@@ -626,7 +647,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let expr = self.parse_expr_inner(Precedence::Unary as usize)?;
                 span.merge(expr.span).attach(Expr::UnOp {
-                    val: Box::new(expr),
+                    expr: Box::new(expr),
                     op: span.attach(UnOp::Not),
                 })
             }
@@ -635,6 +656,12 @@ impl<'a> Parser<'a> {
                 let expr = self.parse_expr()?;
                 self.expect(Token::RParen, None, None)?;
                 expr
+            }
+            Token::LBracket => {
+                self.advance();
+                let elements = self.parse_expr_list(Token::RBracket)?;
+                let last_span = self.expect(Token::RBracket, Some("end of list"), Some(span))?;
+                span.merge(last_span).attach(Expr::List { elements })
             }
             Token::LBrace => {
                 self.advance();
@@ -671,14 +698,14 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let started = self.current().span;
                 match self.current().data {
-                    Token::LParen => {
-                        self.advance();
-                        let args = self.parse_expr_list(Token::RParen)?;
-                        let last_span =
-                            self.expect(Token::RParen, Some("end of constructor"), Some(started))?;
-                        let name = span.attach(name);
-                        span.merge(last_span).attach(Expr::Call { name, args })
-                    }
+                    // Token::LParen => {
+                    //     self.advance();
+                    //     let args = self.parse_expr_list(Token::RParen)?;
+                    //     let last_span =
+                    //         self.expect(Token::RParen, Some("end of constructor"), Some(started))?;
+                    //     let name = span.attach(name);
+                    //     span.merge(last_span).attach(Expr::Call { name, args })
+                    // }
                     Token::LBrace => {
                         self.advance();
                         let mut fields = Vec::new();

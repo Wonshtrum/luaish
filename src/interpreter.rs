@@ -1,10 +1,12 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::fmt;
+use std::fmt::{self, Write};
 use std::rc::Rc;
 
 use crate::log;
 
-use crate::ast::{BinOp, Element, Expr, FuncBody, Stmt, UnOp};
+use crate::ast::{self, BinOp, Element, Expr, FieldConstructor, FuncBody, Stmt, UnOp};
+use crate::resolution::Prototypes;
 use crate::source::{Source, Span, Spanned};
 
 #[derive(Debug)]
@@ -16,9 +18,17 @@ pub enum Error<'a> {
     Break {
         span: Span,
     },
+    MalformedControlFlow {
+        span: Span,
+    },
 
     Custom {
         message: String,
+        span: Span,
+    },
+    OutOfBound {
+        len: usize,
+        index: i64,
         span: Span,
     },
     Unbound {
@@ -29,21 +39,23 @@ pub enum Error<'a> {
         span: Span,
     },
     NotAFunction {
-        ident: String,
         span: Span,
+        found: Value<'a>,
     },
     FFI(&'static str),
     TypeMismatch {
         expected: &'static str,
-        found: String,
+        found: Value<'a>,
         span: Span,
     },
 }
 impl Error<'_> {
     pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
         match self {
-            Self::Return { span, .. } | Self::Break { span } => {
-                out.write_fmt(format_args!("error: malformed control flow"))?;
+            Self::Return { span, .. }
+            | Self::Break { span }
+            | Self::MalformedControlFlow { span } => {
+                out.write_fmt(format_args!("error: malformed control flow\n"))?;
                 source.print_span(*span, out)
             }
 
@@ -53,12 +65,19 @@ impl Error<'_> {
                 source.print_span(*span, out)
             }
             Self::Unbound { ident, span } => {
-                out.write_fmt(format_args!("error: unbound ident `{ident}`"))?;
+                out.write_fmt(format_args!("error: unbound ident `{ident}`\n"))?;
                 source.print_span(*span, out)
             }
-            Self::NotAFunction { ident, span } => {
-                out.write_fmt(format_args!("error: ident `{ident}` is not a function"))?;
+            Self::OutOfBound { len, index, span } => {
+                out.write_fmt(format_args!("error: index {index} out of bounds 0..{len}"))?;
                 source.print_span(*span, out)
+            }
+            Self::NotAFunction { found, span } => {
+                out.write_fmt(format_args!(
+                    "error: expected this expression to be a function\n"
+                ))?;
+                source.print_span(*span, out)?;
+                out.write_fmt(format_args!("but found:\n{found:#?}"))
             }
             Self::Custom { message, span } => {
                 out.write_str(message)?;
@@ -70,10 +89,9 @@ impl Error<'_> {
                 found,
                 span,
             } => {
-                out.write_fmt(format_args!(
-                    "error: type mismatch, expected: {expected}, found:\n{found}\n"
-                ))?;
-                source.print_span(*span, out)
+                out.write_fmt(format_args!("error: type mismatch, expected: {expected}\n"))?;
+                source.print_span(*span, out)?;
+                out.write_fmt(format_args!("but found:\n{found:#?}"))
             }
             Self::FFI(name) => out.write_fmt(format_args!(
                 "error: extern function `{name}` internal error"
@@ -83,13 +101,8 @@ impl Error<'_> {
 }
 
 #[derive(Debug, Clone)]
-enum Field {
-    Index(u64),
-    Name(Rc<str>),
-}
-#[derive(Debug, Clone)]
 pub struct Table<'a> {
-    indexed: BTreeMap<u64, Value<'a>>,
+    indexed: BTreeMap<i64, Value<'a>>,
     named: HashMap<Rc<str>, Value<'a>>,
 }
 impl Table<'_> {
@@ -98,35 +111,61 @@ impl Table<'_> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum Type {
-    Boolean,
-    Float,
-    Integer,
-    String,
-    Struct(Proto),
-}
+// #[derive(Debug, Clone)]
+// pub enum Type {
+//     Boolean,
+//     Float,
+//     Integer,
+//     String,
+//     Struct(Proto),
+// }
+//
+// #[derive(Debug, Clone)]
+// pub struct Proto {
+//     fields: Vec<(String, Type)>,
+// }
 
-#[derive(Debug, Clone)]
-pub struct Proto {
-    fields: Vec<(String, Type)>,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Value<'a> {
     Nil,
     Boolean(bool),
     Float(f64),
     Integer(i64),
-    String(Rc<str>),
+    String(Rc<String>),
+    List(Rc<RefCell<Vec<Value<'a>>>>),
     Struct {
-        typ: &'a Proto,
-        fields: Box<[Value<'a>]>,
+        typ: &'a str,
+        fields: Rc<RefCell<Box<[Value<'a>]>>>,
     },
     Table(Rc<Table<'a>>),
     Func(&'a FuncBody),
     FFI(fn(&mut Context<'a>, span: Span, Vec<Value<'a>>) -> Result<Option<Value<'a>>, Error<'a>>),
 }
+
+impl fmt::Debug for Value<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Nil => f.write_str("nil"),
+            Self::Boolean(true) => f.write_str("true"),
+            Self::Boolean(false) => f.write_str("false"),
+            Self::Float(x) => f.write_fmt(format_args!("{x}")),
+            Self::Integer(x) => f.write_fmt(format_args!("{x}")),
+            Self::String(x) => f.write_fmt(format_args!("{x:?}")),
+            Self::List(x) => fmt::Debug::fmt(&x.borrow(), f),
+            Self::Struct { typ, fields } => {
+                let mut f = f.debug_struct(typ);
+                for (i, field) in fields.borrow().iter().enumerate() {
+                    f.field(&format!("{i}"), field);
+                }
+                f.finish()
+            }
+            Self::Table(_) => f.write_str("{…}"),
+            Self::Func(_) => f.write_str("fn{…}"),
+            Self::FFI(_) => f.write_str("ffi{…}"),
+        }
+    }
+}
+
 impl Value<'_> {
     fn truthy(&self) -> bool {
         match self {
@@ -135,11 +174,22 @@ impl Value<'_> {
             Value::Float(v) => *v != 0.,
             Value::Integer(v) => *v != 0,
             Value::String(v) => !v.is_empty(),
-            Value::Struct { .. } => true,
+            Value::List(v) => !v.borrow().is_empty(),
             Value::Table(v) => !v.is_empty(),
+            Value::Struct { .. } => true,
             Value::Func(_) => true,
             Value::FFI(_) => true,
         }
+    }
+
+    fn coerce<'a>(self, typ: &Spanned<ast::Type>) -> Result<Self, Error<'a>> {
+        Ok(self)
+        // match (self, typ) {
+        //     (_, ast::Type::Function { .. }) => unreachable!(),
+        //     (Value::Nil, _) => todo!(),
+        //     (Value::Float(v), ast::Type::Named { nesting, name }
+        // }
+        // todo!()
     }
 }
 
@@ -147,6 +197,7 @@ type Scope<'a> = HashMap<&'a str, Value<'a>>;
 
 #[derive(Debug)]
 pub struct Context<'a> {
+    protos: Prototypes<'a>,
     scopes: Vec<Scope<'a>>,
 }
 
@@ -203,7 +254,7 @@ fn extern_test<'a>(
     _span: Span,
     args: Vec<Value<'a>>,
 ) -> Result<Option<Value<'a>>, Error<'a>> {
-    log!("TEST");
+    log!("TEST {args:?}");
     match args.as_slice() {
         [Value::Func(f), Value::Integer(n)] => {
             for _ in 0..*n {
@@ -248,7 +299,7 @@ fn extern_exec<'a>(
     Ok(Some(Value::String(Rc::from(res))))
 }
 
-pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<String, Error<'a>> {
+pub fn run<'a>(protos: Prototypes<'a>, stmts: &'a [Spanned<Stmt>]) -> Result<String, Error<'a>> {
     let mut global = Scope::default();
     global.insert("print", Value::FFI(extern_print));
     global.insert("test", Value::FFI(extern_test));
@@ -256,6 +307,7 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<String, Error<'a>> {
     global.insert("exit", Value::FFI(extern_exit));
     let mut ctx = Context {
         scopes: vec![global],
+        protos,
     };
     eval_stmts(&mut ctx, stmts)?;
     Ok(format!("{ctx:#?}"))
@@ -282,8 +334,8 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
                 value,
             });
         }
-        Stmt::Call { name, args } => {
-            let _ = func_call(ctx, name, args)?;
+        Stmt::Call { expr, args } => {
+            let _ = func_call(ctx, expr, args)?;
         }
         Stmt::Binding { lhs, rhs } => {
             for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
@@ -293,8 +345,59 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
         }
         Stmt::Assign { lhs, rhs } => {
             for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
-                let val = eval_expr(ctx, rhs)?;
-                todo!()
+                let rhs = eval_expr(ctx, rhs)?.unwrap();
+                match &lhs.data {
+                    Expr::Identifier(ident) => ctx.set(ident, rhs, lhs.span)?,
+                    Expr::Member { expr, member } => {
+                        let span = expr.span;
+                        let val = eval_expr(ctx, expr)?.unwrap();
+                        match val {
+                            Value::Struct { typ, fields } => {
+                                let offset =
+                                    ctx.protos.offsets.get(&(typ, member.as_str())).unwrap();
+                                let mut fields = fields.borrow_mut();
+                                let field = fields.get_mut(*offset).unwrap();
+                                *field = rhs;
+                            }
+                            _ => {
+                                return Err(Error::TypeMismatch {
+                                    expected: "Type",
+                                    found: val,
+                                    span,
+                                });
+                            }
+                        }
+                    }
+                    Expr::Index { expr, index } => {
+                        let val = eval_expr(ctx, expr)?.unwrap();
+                        let idx = eval_expr(ctx, index)?.unwrap();
+                        let Value::List(l) = val else {
+                            return Err(Error::TypeMismatch {
+                                expected: "List",
+                                found: val,
+                                span: expr.span,
+                            });
+                        };
+                        let Value::Integer(i) = idx else {
+                            return Err(Error::TypeMismatch {
+                                expected: "int",
+                                found: idx,
+                                span: index.span,
+                            });
+                        };
+                        let mut l = l.borrow_mut();
+                        if i < 0 || i as usize >= l.len() {
+                            return Err(Error::OutOfBound {
+                                index: i,
+                                len: l.len(),
+                                span: index.span,
+                            });
+                        }
+                        let e = unsafe { l.get_unchecked_mut(i as usize) };
+                        *e = rhs;
+                    }
+                    _ => unreachable!(),
+                };
             }
         }
         Stmt::If {
@@ -344,20 +447,19 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
 
 fn func_call<'a>(
     ctx: &mut Context<'a>,
-    name: &Spanned<String>,
-    args: &Spanned<Vec<Spanned<Expr>>>,
+    func: &'a Spanned<Expr>,
+    args: &'a Spanned<Vec<Spanned<Expr>>>,
 ) -> Result<Option<Value<'a>>, Error<'a>> {
+    let span = func.span;
+    let func = eval_expr(ctx, func)?.unwrap();
     let args = args
         .iter()
         .map(|arg| eval_expr(ctx, arg).map(|v| v.unwrap()))
         .collect::<Result<Vec<_>, _>>()?;
-    match ctx.get(name, name.span)? {
+    match func {
         Value::Func(func_body) => inner_func_call(ctx, func_body, args),
-        Value::FFI(f) => f(ctx, name.span, args),
-        _ => Err(Error::NotAFunction {
-            ident: name.data.to_owned(),
-            span: name.span,
-        }),
+        Value::FFI(f) => f(ctx, span, args),
+        _ => Err(Error::NotAFunction { span, found: func }),
     }
 }
 pub fn inner_func_call<'a>(
@@ -367,17 +469,23 @@ pub fn inner_func_call<'a>(
 ) -> Result<Option<Value<'a>>, Error<'a>> {
     let mut scope = Scope::default();
     for (arg, val) in func_body.args.iter().zip(args) {
+        let val = val.coerce(&arg.typ)?;
         scope.insert(arg.name.as_str(), val);
     }
     ctx.scopes.push(scope);
-    eval_stmts(ctx, &func_body.body)?;
+    let res = match eval_stmts(ctx, &func_body.body) {
+        Ok(()) => None,
+        Err(Error::Return { value, .. }) => value,
+        Err(Error::Break { span }) => return Err(Error::MalformedControlFlow { span }),
+        Err(error) => return Err(error),
+    };
     ctx.pop();
-    Ok(None)
+    Ok(res)
 }
 
 fn eval_expr<'a>(
     ctx: &mut Context<'a>,
-    expr: &Spanned<Expr>,
+    expr: &'a Spanned<Expr>,
 ) -> Result<Option<Value<'a>>, Error<'a>> {
     let val = match &expr.data {
         Expr::Nil => Value::Nil,
@@ -387,6 +495,14 @@ fn eval_expr<'a>(
         Expr::Integer(val) => Value::Integer(*val),
         Expr::String(val) => Value::String(Rc::from(val.to_owned())),
         Expr::Identifier(ident) => ctx.get(ident, expr.span)?,
+        Expr::List { elements } => {
+            let mut res = Vec::new();
+            for e in &elements.data {
+                let e = eval_expr(ctx, e)?.unwrap();
+                res.push(e);
+            }
+            Value::List(Rc::new(RefCell::new(res)))
+        }
         Expr::Table { elements } => {
             let mut named = HashMap::new();
             let mut indexed = BTreeMap::new();
@@ -404,8 +520,8 @@ fn eval_expr<'a>(
             }
             Value::Table(Rc::new(Table { named, indexed }))
         }
-        Expr::UnOp { val, op } => {
-            let val = eval_expr(ctx, val)?.unwrap();
+        Expr::UnOp { expr, op } => {
+            let val = eval_expr(ctx, expr)?.unwrap();
             match (op.data, val) {
                 (UnOp::Neg, Value::Float(val)) => Value::Float(-val),
                 (UnOp::Neg, Value::Integer(val)) => Value::Integer(-val),
@@ -413,15 +529,47 @@ fn eval_expr<'a>(
                 (op, val) => todo!("{op:?} {val:?}"),
             }
         }
-        Expr::Member { val, member } => {
-            let span = val.span;
-            let val = eval_expr(ctx, val)?.unwrap();
+        Expr::Member { expr, member } => {
+            let span = expr.span;
+            let val = eval_expr(ctx, expr)?.unwrap();
             match val {
                 Value::Table(t) => t.named.get(member.as_str()).cloned().unwrap_or(Value::Nil),
+                Value::Struct { typ, fields } => {
+                    let offset = ctx.protos.offsets.get(&(typ, member.as_str())).unwrap();
+                    fields.borrow().get(*offset).unwrap().clone()
+                }
                 _ => {
                     return Err(Error::TypeMismatch {
-                        expected: "Table",
-                        found: format!("{val:#?}"),
+                        expected: "Struct",
+                        found: val,
+                        span,
+                    });
+                }
+            }
+        }
+        Expr::Index { expr, index } => {
+            let span = expr.span;
+            let val = eval_expr(ctx, expr)?.unwrap();
+            let idx = eval_expr(ctx, index)?.unwrap();
+            match (&val, idx) {
+                (Value::Table(t), Value::Integer(i)) => {
+                    t.indexed.get(&i).cloned().unwrap_or(Value::Nil)
+                }
+                (Value::List(l), Value::Integer(i)) => {
+                    let l = l.borrow();
+                    if i < 0 || i as usize >= l.len() {
+                        return Err(Error::OutOfBound {
+                            index: i,
+                            len: l.len(),
+                            span: index.span,
+                        });
+                    }
+                    unsafe { l.get_unchecked(i as usize).clone() }
+                }
+                _ => {
+                    return Err(Error::TypeMismatch {
+                        expected: "List",
+                        found: val,
                         span,
                     });
                 }
@@ -431,8 +579,44 @@ fn eval_expr<'a>(
             let rhs = eval_expr(ctx, rhs)?.unwrap();
             let lhs = eval_expr(ctx, lhs)?.unwrap();
             match (op.data, lhs, rhs) {
-                (BinOp::Add, Value::String(l), Value::String(r)) => {
-                    Value::String(Rc::from(format!("{l}{r}")))
+                (BinOp::Add, Value::String(l), r) => {
+                    let mut buffer = l.to_string();
+                    match r {
+                        Value::Nil => {
+                            buffer.write_str("nil");
+                        }
+                        Value::Boolean(true) => {
+                            buffer.write_str("true");
+                        }
+                        Value::Boolean(false) => {
+                            buffer.write_str("false");
+                        }
+                        Value::Float(x) => {
+                            buffer.write_fmt(format_args!("{x}"));
+                        }
+                        Value::Integer(x) => {
+                            buffer.write_fmt(format_args!("{x}"));
+                        }
+                        Value::String(x) => {
+                            buffer.write_str(x.as_str());
+                        }
+                        Value::Struct { typ, .. } => {
+                            buffer.write_fmt(format_args!("{typ}{{…}}"));
+                        }
+                        Value::Table(_) => {
+                            buffer.write_str("{…}");
+                        }
+                        Value::List(_) => {
+                            buffer.write_str("[…]");
+                        }
+                        Value::Func(_) => {
+                            buffer.write_str("fn{…}");
+                        }
+                        Value::FFI(_) => {
+                            buffer.write_str("ffi{…}");
+                        }
+                    }
+                    Value::String(Rc::from(buffer))
                 }
 
                 (BinOp::Add, Value::Integer(l), Value::Integer(r)) => Value::Integer(l + r),
@@ -491,11 +675,43 @@ fn eval_expr<'a>(
                         l
                     }
                 }
+
+                (BinOp::Add, Value::List(l), Value::List(r)) => {
+                    let l = l.borrow();
+                    let r = r.borrow();
+                    let mut res = Vec::with_capacity(l.len() + r.len());
+                    res.extend_from_slice(&l);
+                    res.extend_from_slice(&r);
+                    Value::List(Rc::new(RefCell::new(res)))
+                }
+
                 (op, l, r) => todo!("{op:?} {l:?} {r:?}"),
             }
         }
-        Expr::TypeConstructor { name, fields } => todo!(),
-        Expr::Call { name, args } => return func_call(ctx, name, args),
+        Expr::TypeConstructor { name, fields } => {
+            let typ = name.as_str();
+            let size = ctx.protos.sizes.get(typ).unwrap();
+            let mut holder = vec![Value::Nil; *size].into_boxed_slice();
+            for field in &fields.data {
+                let (field_name, val) = match &field.data {
+                    FieldConstructor::Implicit(ident) => {
+                        let val = ctx.get(ident, field.span)?;
+                        (ident.as_str(), val)
+                    }
+                    FieldConstructor::Explicit { name, expr } => {
+                        let val = eval_expr(ctx, expr)?.unwrap();
+                        (name.as_str(), val)
+                    }
+                };
+                let mut offset = ctx.protos.offsets.get(&(typ, field_name)).unwrap();
+                holder[*offset] = val;
+            }
+            Value::Struct {
+                typ,
+                fields: Rc::new(RefCell::new(holder)),
+            }
+        }
+        Expr::Call { expr, args } => return func_call(ctx, expr, args),
         Expr::Func { body } => todo!(),
     };
     Ok(Some(val))
