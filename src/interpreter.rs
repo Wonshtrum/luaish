@@ -13,7 +13,7 @@ use crate::source::{Source, Span, Spanned};
 pub enum Error<'a> {
     Return {
         span: Span,
-        value: Option<Value<'a>>,
+        value: Value<'a>,
     },
     Break {
         span: Span,
@@ -111,20 +111,6 @@ impl Table<'_> {
     }
 }
 
-// #[derive(Debug, Clone)]
-// pub enum Type {
-//     Boolean,
-//     Float,
-//     Integer,
-//     String,
-//     Struct(Proto),
-// }
-//
-// #[derive(Debug, Clone)]
-// pub struct Proto {
-//     fields: Vec<(String, Type)>,
-// }
-
 #[derive(Clone)]
 pub enum Value<'a> {
     Nil,
@@ -139,7 +125,7 @@ pub enum Value<'a> {
     },
     Table(Rc<Table<'a>>),
     Func(&'a FuncBody),
-    FFI(fn(&mut Context<'a>, span: Span, Vec<Value<'a>>) -> Result<Option<Value<'a>>, Error<'a>>),
+    FFI(fn(&mut Context<'a>, span: Span, Vec<Value<'a>>) -> Result<Value<'a>, Error<'a>>),
 }
 
 impl fmt::Debug for Value<'_> {
@@ -236,7 +222,7 @@ fn extern_exit<'a>(
     _ctx: &mut Context<'a>,
     span: Span,
     _args: Vec<Value<'a>>,
-) -> Result<Option<Value<'a>>, Error<'a>> {
+) -> Result<Value<'a>, Error<'a>> {
     log!("EXIT!");
     Err(Error::Exit { span })
 }
@@ -244,23 +230,23 @@ fn extern_print<'a>(
     _ctx: &mut Context<'a>,
     _span: Span,
     args: Vec<Value<'a>>,
-) -> Result<Option<Value<'a>>, Error<'a>> {
+) -> Result<Value<'a>, Error<'a>> {
     log!("PRINT {args:?}");
     let res = Value::Integer(args.len() as i64);
-    Ok(Some(res))
+    Ok(res)
 }
 fn extern_test<'a>(
     ctx: &mut Context<'a>,
     _span: Span,
     args: Vec<Value<'a>>,
-) -> Result<Option<Value<'a>>, Error<'a>> {
+) -> Result<Value<'a>, Error<'a>> {
     log!("TEST {args:?}");
     match args.as_slice() {
         [Value::Func(f), Value::Integer(n)] => {
             for _ in 0..*n {
-                inner_func_call(ctx, f, args.clone())?;
+                inner_func_call(ctx, f, Vec::new())?;
             }
-            Ok(Some(Value::Nil))
+            Ok(Value::Nil)
         }
         _ => Err(Error::FFI("ffi::test")),
     }
@@ -269,7 +255,7 @@ fn extern_exec<'a>(
     ctx: &mut Context<'a>,
     _span: Span,
     args: Vec<Value<'a>>,
-) -> Result<Option<Value<'a>>, Error<'a>> {
+) -> Result<Value<'a>, Error<'a>> {
     let args = args
         .into_iter()
         .filter_map(|arg| {
@@ -296,7 +282,7 @@ fn extern_exec<'a>(
         Ok(res) => String::from_utf8_lossy(&res.stdout).to_string(),
         Err(error) => error.to_string(),
     };
-    Ok(Some(Value::String(Rc::from(res))))
+    Ok(Value::String(Rc::from(res)))
 }
 
 pub fn run<'a>(protos: Prototypes<'a>, stmts: &'a [Spanned<Stmt>]) -> Result<String, Error<'a>> {
@@ -327,7 +313,7 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
             let value = if let Some(expr) = expr {
                 eval_expr(ctx, expr)?
             } else {
-                None
+                Value::Nil
             };
             return Err(Error::Return {
                 span: stmt.span,
@@ -339,18 +325,18 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
         }
         Stmt::Binding { lhs, rhs } => {
             for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
-                let val = eval_expr(ctx, rhs)?.unwrap();
+                let val = eval_expr(ctx, rhs)?;
                 ctx.set(lhs, val, lhs.span)?;
             }
         }
         Stmt::Assign { lhs, rhs } => {
             for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
-                let rhs = eval_expr(ctx, rhs)?.unwrap();
+                let rhs = eval_expr(ctx, rhs)?;
                 match &lhs.data {
                     Expr::Identifier(ident) => ctx.set(ident, rhs, lhs.span)?,
                     Expr::Member { expr, member } => {
                         let span = expr.span;
-                        let val = eval_expr(ctx, expr)?.unwrap();
+                        let val = eval_expr(ctx, expr)?;
                         match val {
                             Value::Struct { typ, fields } => {
                                 let offset =
@@ -369,8 +355,8 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
                         }
                     }
                     Expr::Index { expr, index } => {
-                        let val = eval_expr(ctx, expr)?.unwrap();
-                        let idx = eval_expr(ctx, index)?.unwrap();
+                        let val = eval_expr(ctx, expr)?;
+                        let idx = eval_expr(ctx, index)?;
                         let Value::List(l) = val else {
                             return Err(Error::TypeMismatch {
                                 expected: "List",
@@ -406,14 +392,14 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
             else_if_blocks,
             else_block,
         } => {
-            if eval_expr(ctx, condition)?.unwrap().truthy() {
+            if eval_expr(ctx, condition)?.truthy() {
                 ctx.push();
                 eval_stmts(ctx, then_block)?;
                 ctx.pop();
                 return Ok(());
             }
             for (condition, then_block) in else_if_blocks {
-                if eval_expr(ctx, condition)?.unwrap().truthy() {
+                if eval_expr(ctx, condition)?.truthy() {
                     ctx.push();
                     eval_stmts(ctx, then_block)?;
                     ctx.pop();
@@ -449,12 +435,12 @@ fn func_call<'a>(
     ctx: &mut Context<'a>,
     func: &'a Spanned<Expr>,
     args: &'a Spanned<Vec<Spanned<Expr>>>,
-) -> Result<Option<Value<'a>>, Error<'a>> {
+) -> Result<Value<'a>, Error<'a>> {
     let span = func.span;
-    let func = eval_expr(ctx, func)?.unwrap();
+    let func = eval_expr(ctx, func)?;
     let args = args
         .iter()
-        .map(|arg| eval_expr(ctx, arg).map(|v| v.unwrap()))
+        .map(|arg| eval_expr(ctx, arg))
         .collect::<Result<Vec<_>, _>>()?;
     match func {
         Value::Func(func_body) => inner_func_call(ctx, func_body, args),
@@ -466,7 +452,7 @@ pub fn inner_func_call<'a>(
     ctx: &mut Context<'a>,
     func_body: &'a FuncBody,
     args: Vec<Value<'a>>,
-) -> Result<Option<Value<'a>>, Error<'a>> {
+) -> Result<Value<'a>, Error<'a>> {
     let mut scope = Scope::default();
     for (arg, val) in func_body.args.iter().zip(args) {
         let val = val.coerce(&arg.typ)?;
@@ -474,7 +460,7 @@ pub fn inner_func_call<'a>(
     }
     ctx.scopes.push(scope);
     let res = match eval_stmts(ctx, &func_body.body) {
-        Ok(()) => None,
+        Ok(()) => Value::Nil,
         Err(Error::Return { value, .. }) => value,
         Err(Error::Break { span }) => return Err(Error::MalformedControlFlow { span }),
         Err(error) => return Err(error),
@@ -483,10 +469,7 @@ pub fn inner_func_call<'a>(
     Ok(res)
 }
 
-fn eval_expr<'a>(
-    ctx: &mut Context<'a>,
-    expr: &'a Spanned<Expr>,
-) -> Result<Option<Value<'a>>, Error<'a>> {
+fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<Value<'a>, Error<'a>> {
     let val = match &expr.data {
         Expr::Nil => Value::Nil,
         Expr::True => Value::Boolean(true),
@@ -498,7 +481,7 @@ fn eval_expr<'a>(
         Expr::List { elements } => {
             let mut res = Vec::new();
             for e in &elements.data {
-                let e = eval_expr(ctx, e)?.unwrap();
+                let e = eval_expr(ctx, e)?;
                 res.push(e);
             }
             Value::List(Rc::new(RefCell::new(res)))
@@ -510,18 +493,18 @@ fn eval_expr<'a>(
             for e in elements {
                 match &e.data {
                     Element::Indexed(expr) => {
-                        indexed.insert(index, eval_expr(ctx, expr)?.unwrap());
+                        indexed.insert(index, eval_expr(ctx, expr)?);
                         index += 1;
                     }
                     Element::Named { name, expr } => {
-                        named.insert(Rc::from(name.to_string()), eval_expr(ctx, expr)?.unwrap());
+                        named.insert(Rc::from(name.to_string()), eval_expr(ctx, expr)?);
                     }
                 }
             }
             Value::Table(Rc::new(Table { named, indexed }))
         }
         Expr::UnOp { expr, op } => {
-            let val = eval_expr(ctx, expr)?.unwrap();
+            let val = eval_expr(ctx, expr)?;
             match (op.data, val) {
                 (UnOp::Neg, Value::Float(val)) => Value::Float(-val),
                 (UnOp::Neg, Value::Integer(val)) => Value::Integer(-val),
@@ -531,7 +514,7 @@ fn eval_expr<'a>(
         }
         Expr::Member { expr, member } => {
             let span = expr.span;
-            let val = eval_expr(ctx, expr)?.unwrap();
+            let val = eval_expr(ctx, expr)?;
             match val {
                 Value::Table(t) => t.named.get(member.as_str()).cloned().unwrap_or(Value::Nil),
                 Value::Struct { typ, fields } => {
@@ -549,8 +532,8 @@ fn eval_expr<'a>(
         }
         Expr::Index { expr, index } => {
             let span = expr.span;
-            let val = eval_expr(ctx, expr)?.unwrap();
-            let idx = eval_expr(ctx, index)?.unwrap();
+            let val = eval_expr(ctx, expr)?;
+            let idx = eval_expr(ctx, index)?;
             match (&val, idx) {
                 (Value::Table(t), Value::Integer(i)) => {
                     t.indexed.get(&i).cloned().unwrap_or(Value::Nil)
@@ -576,8 +559,8 @@ fn eval_expr<'a>(
             }
         }
         Expr::BinOp { rhs, lhs, op } => {
-            let rhs = eval_expr(ctx, rhs)?.unwrap();
-            let lhs = eval_expr(ctx, lhs)?.unwrap();
+            let rhs = eval_expr(ctx, rhs)?;
+            let lhs = eval_expr(ctx, lhs)?;
             match (op.data, lhs, rhs) {
                 (BinOp::Add, Value::String(l), r) => {
                     let mut buffer = l.to_string();
@@ -699,7 +682,7 @@ fn eval_expr<'a>(
                         (ident.as_str(), val)
                     }
                     FieldConstructor::Explicit { name, expr } => {
-                        let val = eval_expr(ctx, expr)?.unwrap();
+                        let val = eval_expr(ctx, expr)?;
                         (name.as_str(), val)
                     }
                 };
@@ -714,5 +697,5 @@ fn eval_expr<'a>(
         Expr::Call { expr, args } => return func_call(ctx, expr, args),
         Expr::Func { body } => todo!(),
     };
-    Ok(Some(val))
+    Ok(val)
 }

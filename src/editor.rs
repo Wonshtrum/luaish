@@ -1486,7 +1486,11 @@ fn visit_expr(expr: &Spanned<Expr>, cursor: usize, path: &mut Vec<AstNode>) {
                 visit_expr(rhs, cursor, path);
             }
         }
-        Expr::Func { body } => todo!(),
+        Expr::Func { body } => {
+            if body.body.contains(cursor) {
+                visit_stmts(&body.body, cursor, path);
+            }
+        }
     }
 }
 
