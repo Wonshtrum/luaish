@@ -1445,7 +1445,7 @@ fn visit_expr(expr: &Spanned<Expr>, cursor: usize, path: &mut Vec<AstNode>) {
                 visit_exprs(args, cursor, path);
             }
         }
-        Expr::Member { expr, member } => {
+        Expr::Member { expr, member, .. } => {
             if expr.contains(cursor) {
                 visit_expr(expr, cursor, path);
                 return;

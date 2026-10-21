@@ -328,7 +328,7 @@ impl<'a> Lexer<'a> {
                 match ident.as_str() {
                     "break" => Token::Break,
                     "for" => Token::For,
-                    "do" => Token::For,
+                    "do" => Token::Do,
                     "end" => Token::End,
                     "if" => Token::If,
                     "then" => Token::Then,

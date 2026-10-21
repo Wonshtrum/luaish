@@ -44,6 +44,10 @@ pub enum Error {
     MalformedControlFow {
         span: Span,
     },
+    InvalidMethod {
+        ident: String,
+        span: Span,
+    },
 }
 impl Error {
     pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
@@ -94,6 +98,12 @@ impl Error {
                 ))?;
                 source.print_span(*span, out)
             }
+            Self::InvalidMethod { ident, span } => {
+                out.write_fmt(format_args!(
+                    "error: `{ident}` is not a method for this struct\n"
+                ))?;
+                source.print_span(*span, out)
+            }
             Self::ExpectedFunction { found, span } => {
                 out.write_fmt(format_args!("error: expected function, found `{found}`\n"))?;
                 source.print_span(*span, out)
@@ -113,7 +123,10 @@ pub struct NType {
     inner: Type,
 }
 impl NType {
-    fn can_coerce(&self, other: &NType) -> bool {
+    fn unify(&self, other: &NType, infers: &mut HashMap<usize, Type>) -> bool {
+        if self == &ANY {
+            return true;
+        }
         if self.nesting != other.nesting {
             return false;
         }
@@ -121,13 +134,36 @@ impl NType {
             return true;
         }
         match (&self.inner, &other.inner) {
-            // (Type::String, _) => true,
+            (Type::Infer(a), Type::Infer(b)) => a == b,
+            (Type::Infer(a), b) => {
+                infers.insert(*a, b.clone());
+                true
+            }
+            (a, Type::Infer(b)) => {
+                infers.insert(*b, a.clone());
+                true
+            }
             (Type::Any, _) => true,
             (Type::Integer, Type::Float) => true,
             (Type::Float, Type::Integer) => true,
             _ => false,
         }
     }
+    // fn can_coerce(&self, other: &NType) -> bool {
+    //     if self.nesting != other.nesting {
+    //         return false;
+    //     }
+    //     if self.inner == other.inner {
+    //         return true;
+    //     }
+    //     match (&self.inner, &other.inner) {
+    //         // (Type::String, _) => true,
+    //         (Type::Any, _) => true,
+    //         (Type::Integer, Type::Float) => true,
+    //         (Type::Float, Type::Integer) => true,
+    //         _ => false,
+    //     }
+    // }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +175,12 @@ pub enum Type {
     Integer,
     String,
     Struct(TypeId),
-    Func { args: Vec<NType>, ret: Box<NType> },
+    Func {
+        args: Vec<NType>,
+        ret: Box<NType>,
+        with_self: bool,
+    },
+    Infer(usize),
 }
 
 const ANY: NType = NType {
@@ -187,6 +228,7 @@ impl fmt::Display for NType {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
+            Type::Infer(id) => return f.write_fmt(format_args!("?{id}")),
             Type::Any => "*",
             Type::Nil => "nil",
             Type::Boolean => "bool",
@@ -194,8 +236,16 @@ impl fmt::Display for Type {
             Type::Integer => "int",
             Type::String => "str",
             Type::Struct(id) => return f.write_fmt(format_args!("#{id}")),
-            Type::Func { args, ret } => {
-                f.write_str("fn(")?;
+            Type::Func {
+                args,
+                ret,
+                with_self,
+            } => {
+                if *with_self {
+                    f.write_str("fn:(")?;
+                } else {
+                    f.write_str("fn(")?;
+                }
                 for (i, arg) in args.iter().enumerate() {
                     if i != 0 {
                         f.write_char(',')?;
@@ -233,6 +283,8 @@ pub struct Context<'a> {
     names: HashMap<&'a str, TypeId>,
     protos: HashMap<TypeId, StructProto<'a>>,
     scopes: Vec<Scope<'a>>,
+    infers: HashMap<usize, Type>,
+    infer_id: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -249,10 +301,23 @@ impl<'a> Context<'a> {
         self.scopes.pop();
     }
 
-    pub fn get(&self, ident: &str, span: Span) -> Result<&NType, Error> {
+    pub fn fresh(&mut self) -> usize {
+        self.infer_id += 1;
+        self.infer_id
+    }
+
+    pub fn get(&self, ident: &str, span: Span) -> Result<NType, Error> {
         for scope in self.scopes.iter().rev() {
-            if let Some(tid) = scope.get(ident) {
-                return Ok(tid);
+            if let Some(typ) = scope.get(ident) {
+                if let Type::Infer(x) = &typ.inner {
+                    if let Some(inner) = self.infers.get(x) {
+                        return Ok(NType {
+                            nesting: typ.nesting,
+                            inner: inner.to_owned(),
+                        });
+                    }
+                }
+                return Ok(typ.to_owned());
             }
         }
         Err(Error::Unbound {
@@ -264,9 +329,18 @@ impl<'a> Context<'a> {
         &mut self,
         local: bool,
         ident: &'a str,
-        typ: NType,
+        mut typ: NType,
         span: Span,
     ) -> Result<(), Error> {
+        // if let Type::Func {
+        //     with_self: with_self @ true,
+        //     args,
+        //     ..
+        // } = &mut typ.inner
+        // {
+        //     *with_self = false;
+        //     args.remove(0);
+        // }
         if local {
             let scope = self.scopes.last_mut().unwrap();
             let shadow = scope.insert(ident, typ);
@@ -279,6 +353,22 @@ impl<'a> Context<'a> {
             if let Some(old) = scope.get_mut(ident) {
                 if old == &typ {
                     return Ok(());
+                }
+                if old.nesting == typ.nesting {
+                    if let Type::Infer(x) = &old.inner {
+                        if let Some(t) = self.infers.get(x) {
+                            if t == &typ.inner {
+                                return Ok(());
+                            }
+                        } else if let Type::Infer(y) = &typ.inner {
+                            if x == y {
+                                return Ok(());
+                            }
+                        } else {
+                            self.infers.insert(*x, typ.inner);
+                            return Ok(());
+                        }
+                    }
                 }
                 return Err(Error::Mismatch {
                     expected: old.to_owned(),
@@ -325,6 +415,7 @@ fn process_type<'a>(names: &mut HashMap<&'a str, TypeId>, typ: &'a ast::Type) ->
                 Type::Func {
                     args,
                     ret: Box::new(ret),
+                    with_self: false,
                 },
             )
         }
@@ -364,6 +455,7 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
             inner: Type::Func {
                 args: vec![ANY],
                 ret: Box::new(INTEGER),
+                with_self: false,
             },
         },
     );
@@ -378,11 +470,13 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
                         inner: Type::Func {
                             args: vec![],
                             ret: Box::new(NIL),
+                            with_self: false,
                         },
                     },
                     INTEGER,
                 ],
                 ret: Box::new(NIL),
+                with_self: false,
             },
         },
     );
@@ -396,6 +490,7 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
                     inner: Type::String,
                 }],
                 ret: Box::new(STRING),
+                with_self: false,
             },
         },
     );
@@ -406,6 +501,7 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
             inner: Type::Func {
                 args: vec![],
                 ret: Box::new(NIL),
+                with_self: false,
             },
         },
     );
@@ -414,12 +510,14 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
         names,
         protos,
         scopes: vec![global],
+        infers: HashMap::new(),
+        infer_id: 0,
     };
-    log!("{ctx:#?}");
 
     for stmt in stmts {
         eval_stmt(&mut ctx, stmt, None)?;
     }
+    log!("{ctx:#?}");
 
     let mut offsets = HashMap::new();
     let mut sizes = HashMap::new();
@@ -444,7 +542,15 @@ fn eval_call<'a>(
 ) -> Result<NType, Error> {
     let typ = eval_expr(ctx, expr)?;
     if typ.nesting == 0 {
-        if let Type::Func { args, ret } = typ.inner {
+        if let Type::Func {
+            mut args,
+            ret,
+            with_self,
+        } = typ.inner
+        {
+            if with_self {
+                args.remove(0);
+            }
             if args.len() != exprs.len() {
                 return Err(Error::WrongNumberOfElements {
                     expected: args.len(),
@@ -454,7 +560,7 @@ fn eval_call<'a>(
             }
             for (arg_typ, expr) in args.into_iter().zip(exprs.iter()) {
                 let typ = eval_expr(ctx, expr)?;
-                if !arg_typ.can_coerce(&typ) {
+                if !arg_typ.unify(&typ, &mut ctx.infers) {
                     return Err(Error::Mismatch {
                         expected: arg_typ,
                         found: typ,
@@ -491,7 +597,11 @@ fn eval_func<'a>(ctx: &mut Context<'a>, body: &'a FuncBody) -> Result<NType, Err
     let ret = Box::new(ret.data);
     Ok(NType {
         nesting: 0,
-        inner: Type::Func { args, ret },
+        inner: Type::Func {
+            args,
+            ret,
+            with_self: false,
+        },
     })
 }
 
@@ -523,7 +633,7 @@ pub fn eval_stmt<'a>(
             } else {
                 (NIL, stmt.span)
             };
-            if !ret.can_coerce(&typ) {
+            if !ret.unify(&typ, &mut ctx.infers) {
                 return Err(Error::Mismatch {
                     expected: ret.data.to_owned(),
                     found: typ,
@@ -558,7 +668,7 @@ pub fn eval_stmt<'a>(
             for (l, r) in lhs.iter().zip(rhs.iter()) {
                 let ltyp = eval_expr(ctx, l)?;
                 let rtyp = eval_expr(ctx, r)?;
-                if !ltyp.can_coerce(&rtyp) {
+                if !ltyp.unify(&rtyp, &mut ctx.infers) {
                     return Err(Error::Mismatch {
                         expected: ltyp,
                         found: rtyp,
@@ -575,7 +685,7 @@ pub fn eval_stmt<'a>(
         } => {
             {
                 let typ = eval_expr(ctx, condition)?;
-                if typ != BOOLEAN {
+                if !BOOLEAN.unify(&typ, &mut ctx.infers) {
                     return Err(Error::Mismatch {
                         expected: BOOLEAN,
                         found: typ,
@@ -588,7 +698,7 @@ pub fn eval_stmt<'a>(
             }
             for (condition, then_block) in else_if_blocks {
                 let typ = eval_expr(ctx, condition)?;
-                if typ != BOOLEAN {
+                if !BOOLEAN.unify(&typ, &mut ctx.infers) {
                     return Err(Error::Mismatch {
                         expected: BOOLEAN,
                         found: typ,
@@ -626,7 +736,7 @@ pub fn eval_stmt<'a>(
 
 pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<NType, Error> {
     let inner = match &expr.data {
-        Expr::Nil => Type::Nil,
+        Expr::Nil => Type::Infer(ctx.fresh()),
         Expr::True => Type::Boolean,
         Expr::False => Type::Boolean,
         Expr::Float(_) => Type::Float,
@@ -634,12 +744,15 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
         Expr::String(_) => Type::String,
         Expr::List { elements } => {
             let Some(base) = elements.first() else {
-                return todo!();
+                return Ok(NType {
+                    nesting: 1,
+                    inner: Type::Infer(ctx.fresh()),
+                });
             };
             let mut base_typ = eval_expr(ctx, base)?;
             for e in &elements.data[1..] {
                 let typ = eval_expr(ctx, e)?;
-                if base_typ != typ {
+                if !base_typ.unify(&typ, &mut ctx.infers) {
                     return Err(Error::Mismatch {
                         expected: base_typ,
                         found: typ,
@@ -651,7 +764,7 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
             return Ok(base_typ);
         }
         Expr::Identifier(ident) => {
-            return ctx.get(ident, expr.span).cloned();
+            return ctx.get(ident, expr.span);
         }
         Expr::UnOp { expr, op } => {
             let typ = eval_expr(ctx, expr)?;
@@ -762,10 +875,10 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
                         let typ = ctx.get(name, field.span)?;
                         for proto_field in &proto_fields {
                             if proto_field.0 == name {
-                                if !proto_field.1.can_coerce(typ) {
+                                if !proto_field.1.unify(&typ, &mut ctx.infers) {
                                     return Err(Error::Mismatch {
                                         expected: proto_field.1.to_owned(),
-                                        found: typ.to_owned(),
+                                        found: typ,
                                         span: field.span,
                                     });
                                 }
@@ -781,10 +894,10 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
                         let typ = eval_expr(ctx, expr)?;
                         for proto_field in &proto_fields {
                             if proto_field.0 == name.as_str() {
-                                if !proto_field.1.can_coerce(&typ) {
+                                if !proto_field.1.unify(&typ, &mut ctx.infers) {
                                     return Err(Error::Mismatch {
                                         expected: proto_field.1.to_owned(),
-                                        found: typ.to_owned(),
+                                        found: typ,
                                         span: name.span,
                                     });
                                 }
@@ -801,12 +914,16 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
             Type::Struct(proto_id)
         }
         Expr::Func { body } => eval_func(ctx, body)?.inner,
-        Expr::Member { expr, member } => {
-            let typ = eval_expr(ctx, expr)?;
-            if typ.nesting != 0 {
+        Expr::Member {
+            with_self,
+            expr,
+            member,
+        } => {
+            let self_typ = eval_expr(ctx, expr)?;
+            if self_typ.nesting != 0 {
                 panic!("expected struct");
             }
-            let Type::Struct(proto_id) = typ.inner else {
+            let Type::Struct(proto_id) = self_typ.inner else {
                 panic!("expected struct")
             };
             let Some(proto) = ctx.protos.get(&proto_id) else {
@@ -814,7 +931,40 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
             };
             for (name, typ) in &proto.fields {
                 if member.as_str() == *name {
-                    return Ok(typ.clone());
+                    if *with_self {
+                        if typ.nesting == 0 {
+                            log!("-- nest");
+                            if let Type::Func {
+                                args,
+                                ret,
+                                with_self: false,
+                            } = &typ.inner
+                            {
+                                log!("-- func");
+                                if let Some(arg_typ) = args.first() {
+                                    log!("-- first");
+                                    if *arg_typ == self_typ {
+                                        log!("-- self");
+                                        let typ = NType {
+                                            nesting: 0,
+                                            inner: Type::Func {
+                                                args: args.clone(),
+                                                ret: ret.clone(),
+                                                with_self: true,
+                                            },
+                                        };
+                                        return Ok(typ);
+                                    }
+                                }
+                            }
+                        }
+                        return Err(Error::InvalidMethod {
+                            ident: member.to_string(),
+                            span: member.span,
+                        });
+                    } else {
+                        return Ok(typ.clone());
+                    }
                 }
             }
             return Err(Error::UnexpectedField {
@@ -828,7 +978,7 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
                 panic!("expected list");
             }
             let idx_typ = eval_expr(ctx, index)?;
-            if idx_typ != INTEGER {
+            if !INTEGER.unify(&idx_typ, &mut ctx.infers) {
                 return Err(Error::Mismatch {
                     expected: INTEGER,
                     found: idx_typ,

@@ -118,6 +118,7 @@ pub enum Expr {
     Member {
         expr: Box<Spanned<Expr>>,
         member: Spanned<String>,
+        with_self: bool,
     },
     Index {
         expr: Box<Spanned<Expr>>,
@@ -252,8 +253,13 @@ impl fmt::Debug for Expr {
                 }
                 l.finish()
             }
-            Self::Member { expr, member } => f
+            Self::Member {
+                with_self,
+                expr,
+                member,
+            } => f
                 .debug_struct("MemberAccess")
+                .field("with_self", with_self)
                 .field("expr", expr)
                 .field("member", member)
                 .finish(),

@@ -32,7 +32,7 @@ pub enum Error<'a> {
         span: Span,
     },
     Unbound {
-        ident: String,
+        ident: &'a str,
         span: Span,
     },
     Exit {
@@ -125,6 +125,7 @@ pub enum Value<'a> {
     },
     Table(Rc<Table<'a>>),
     Func(&'a FuncBody),
+    Method(Box<Value<'a>>, &'a FuncBody),
     FFI(fn(&mut Context<'a>, span: Span, Vec<Value<'a>>) -> Result<Value<'a>, Error<'a>>),
 }
 
@@ -147,6 +148,7 @@ impl fmt::Debug for Value<'_> {
             }
             Self::Table(_) => f.write_str("{…}"),
             Self::Func(_) => f.write_str("fn{…}"),
+            Self::Method(..) => f.write_str("fn:{…}"),
             Self::FFI(_) => f.write_str("ffi{…}"),
         }
     }
@@ -164,6 +166,7 @@ impl Value<'_> {
             Value::Table(v) => !v.is_empty(),
             Value::Struct { .. } => true,
             Value::Func(_) => true,
+            Value::Method(..) => true,
             Value::FFI(_) => true,
         }
     }
@@ -195,26 +198,32 @@ impl<'a> Context<'a> {
         self.scopes.pop();
     }
 
-    pub fn get(&mut self, ident: &str, span: Span) -> Result<Value<'a>, Error<'a>> {
+    pub fn get(&mut self, ident: &'a str, span: Span) -> Result<Value<'a>, Error<'a>> {
         for scope in self.scopes.iter().rev() {
             if let Some(val) = scope.get(ident) {
                 return Ok(val.clone());
             }
         }
-        Err(Error::Unbound {
-            ident: ident.to_owned(),
-            span,
-        })
+        Err(Error::Unbound { ident, span })
     }
-    pub fn set(&mut self, ident: &'a str, val: Value<'a>, span: Span) -> Result<(), Error<'a>> {
+    pub fn set(
+        &mut self,
+        local: bool,
+        ident: &'a str,
+        val: Value<'a>,
+        span: Span,
+    ) -> Result<(), Error<'a>> {
+        if local {
+            self.scopes.last_mut().unwrap().insert(ident, val);
+            return Ok(());
+        }
         for scope in self.scopes.iter_mut().rev() {
             if let Some(binding) = scope.get_mut(ident) {
                 *binding = val;
                 return Ok(());
             }
         }
-        self.scopes.last_mut().unwrap().insert(ident, val);
-        Ok(())
+        Err(Error::Unbound { ident, span })
     }
 }
 
@@ -326,15 +335,22 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
         Stmt::Binding { lhs, rhs } => {
             for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
                 let val = eval_expr(ctx, rhs)?;
-                ctx.set(lhs, val, lhs.span)?;
+                ctx.set(true, lhs, val, lhs.span)?;
             }
         }
         Stmt::Assign { lhs, rhs } => {
             for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
                 let rhs = eval_expr(ctx, rhs)?;
                 match &lhs.data {
-                    Expr::Identifier(ident) => ctx.set(ident, rhs, lhs.span)?,
-                    Expr::Member { expr, member } => {
+                    Expr::Identifier(ident) => ctx.set(false, ident, rhs, lhs.span)?,
+                    Expr::Member {
+                        with_self,
+                        expr,
+                        member,
+                    } => {
+                        if *with_self {
+                            unreachable!()
+                        }
                         let span = expr.span;
                         let val = eval_expr(ctx, expr)?;
                         match val {
@@ -425,7 +441,7 @@ fn eval_stmt<'a>(ctx: &mut Context<'a>, stmt: &'a Spanned<Stmt>) -> Result<(), E
             name,
             body,
         } => {
-            ctx.set(name, Value::Func(body), name.span)?;
+            ctx.set(true, name, Value::Func(body), name.span)?;
         }
     }
     Ok(())
@@ -438,12 +454,16 @@ fn func_call<'a>(
 ) -> Result<Value<'a>, Error<'a>> {
     let span = func.span;
     let func = eval_expr(ctx, func)?;
-    let args = args
+    let mut args = args
         .iter()
         .map(|arg| eval_expr(ctx, arg))
         .collect::<Result<Vec<_>, _>>()?;
     match func {
         Value::Func(func_body) => inner_func_call(ctx, func_body, args),
+        Value::Method(this, func_body) => {
+            args.insert(0, *this);
+            inner_func_call(ctx, func_body, args)
+        }
         Value::FFI(f) => f(ctx, span, args),
         _ => Err(Error::NotAFunction { span, found: func }),
     }
@@ -512,14 +532,23 @@ fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<Value
                 (op, val) => todo!("{op:?} {val:?}"),
             }
         }
-        Expr::Member { expr, member } => {
+        Expr::Member {
+            with_self,
+            expr,
+            member,
+        } => {
             let span = expr.span;
             let val = eval_expr(ctx, expr)?;
-            match val {
+            match &val {
                 Value::Table(t) => t.named.get(member.as_str()).cloned().unwrap_or(Value::Nil),
                 Value::Struct { typ, fields } => {
                     let offset = ctx.protos.offsets.get(&(typ, member.as_str())).unwrap();
-                    fields.borrow().get(*offset).unwrap().clone()
+                    let f = fields.borrow().get(*offset).unwrap().clone();
+                    match (with_self, f) {
+                        (true, Value::Func(func_body)) => Value::Method(Box::new(val), func_body),
+                        (false, f) => f,
+                        (true, f) => unreachable!("{f:?}"),
+                    }
                 }
                 _ => {
                     return Err(Error::TypeMismatch {
@@ -594,6 +623,12 @@ fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<Value
                         }
                         Value::Func(_) => {
                             buffer.write_str("fn{…}");
+                        }
+                        Value::Method(this, _) => {
+                            let Value::Struct { typ, .. } = &*this else {
+                                unreachable!()
+                            };
+                            buffer.write_fmt(format_args!("{typ}:fn{{…}}"));
                         }
                         Value::FFI(_) => {
                             buffer.write_str("ffi{…}");

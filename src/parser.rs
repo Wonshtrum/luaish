@@ -371,54 +371,6 @@ impl<'a> Parser<'a> {
                     else_block,
                 })
             }
-            // Token::Identifier(ident) => {
-            //     let ident = span.attach(ident.to_owned());
-            //     self.advance();
-            //     let token = self.current();
-            //     let lhs_span = span;
-            //     if token.same_kind_as(&Token::LParen) {
-            //         if is_local {
-            //             return Err(Error::Unexpected {
-            //                 message: None,
-            //                 expected: vec![],
-            //                 found: token.to_owned(),
-            //                 started: None,
-            //             });
-            //         }
-            //         self.advance();
-            //         let args = self.parse_expr_list(Token::RParen)?;
-            //         let last_span =
-            //             self.expect(Token::RParen, Some("end of arg list"), Some(span))?;
-            //         return Ok(span
-            //             .merge(last_span)
-            //             .attach(Stmt::Call { name: ident, args }));
-            //     }
-            //     let mut lhs = vec![ident];
-            //     let mut last_span = lhs_span;
-            //     while self.current().same_kind_as(&Token::Comma) {
-            //         self.advance();
-            //         let ident = self.expect_identifier(None)?;
-            //         last_span = ident.span;
-            //         lhs.push(ident);
-            //     }
-            //     self.expect(Token::Assign, None, None)?;
-            //     let lhs = lhs_span.merge(last_span).attach(lhs);
-
-            //     let expr = self.parse_expr()?;
-            //     let rhs_span = expr.span;
-            //     let mut last_span = rhs_span;
-            //     let mut rhs = vec![expr];
-            //     while self.current().same_kind_as(&Token::Comma) {
-            //         self.advance();
-            //         let expr = self.parse_expr()?;
-            //         last_span = expr.span;
-            //         rhs.push(expr);
-            //     }
-            //     let rhs = rhs_span.merge(last_span).attach(rhs);
-
-            //     span.merge(last_span)
-            //         .attach(Stmt::Assigns { is_local, lhs, rhs })
-            // }
             _ => {
                 if is_local {
                     let first = self.expect_identifier(None)?;
@@ -509,7 +461,7 @@ impl<'a> Parser<'a> {
             Token::LShift | Token::RShift => Some(Precedence::BitShift),
             Token::And => Some(Precedence::LAnd),
             Token::Or => Some(Precedence::LOr),
-            Token::LParen | Token::LBracket | Token::LBrace => Some(Precedence::Call),
+            Token::LParen | Token::LBracket => Some(Precedence::Call),
             Token::Dot | Token::Colon => Some(Precedence::Member),
             Token::EQ | Token::NE | Token::LT | Token::GT | Token::LE | Token::GE => {
                 Some(Precedence::Comparison)
@@ -561,9 +513,11 @@ impl<'a> Parser<'a> {
             Token::LE => BinOp::LE,
             Token::GE => BinOp::GE,
             Token::Dot | Token::Colon => {
+                let with_self = token.same_kind_as(&Token::Colon);
                 self.advance();
                 let member = self.expect_identifier(Some("member"))?;
                 let expr = lhs.span.merge(member.span).attach(Expr::Member {
+                    with_self,
                     expr: Box::new(lhs),
                     member,
                 });
@@ -593,7 +547,7 @@ impl<'a> Parser<'a> {
                 });
                 return Ok(expr);
             }
-            _ => unreachable!(),
+            _ => unreachable!("{token:?}"),
         };
         let op = token.span.attach(op);
         self.advance();
@@ -698,14 +652,6 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let started = self.current().span;
                 match self.current().data {
-                    // Token::LParen => {
-                    //     self.advance();
-                    //     let args = self.parse_expr_list(Token::RParen)?;
-                    //     let last_span =
-                    //         self.expect(Token::RParen, Some("end of constructor"), Some(started))?;
-                    //     let name = span.attach(name);
-                    //     span.merge(last_span).attach(Expr::Call { name, args })
-                    // }
                     Token::LBrace => {
                         self.advance();
                         let mut fields = Vec::new();
@@ -773,22 +719,4 @@ impl<'a> Parser<'a> {
         }
         Ok(span.merge(last_span).attach(exprs))
     }
-
-    // fn parse_block(&mut self) -> Result<Spanned<Block>, Error> {
-    //     let span = self.expect(Token::LBrace, Some("start of block"), None)?;
-    //     let mut exprs = Vec::new();
-    //     let mut value = None;
-    //     while self.current() != Token::RBrace {
-    //         let expr = self.parse_expr()?;
-    //         if self.current() == Token::Semicolon {
-    //             self.advance();
-    //             exprs.push(expr);
-    //         } else {
-    //             value = Some(Box::new(expr));
-    //             break;
-    //         }
-    //     }
-    //     let last_span = self.expect(Token::RBrace, Some("end of block"), Some(span))?;
-    //     Ok(span.merge(last_span).attach(Block { exprs, value }))
-    // }
 }
