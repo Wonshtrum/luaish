@@ -6,12 +6,12 @@ use crate::log;
 use crate::source::{Source, Span, Spanned};
 
 #[derive(Debug)]
-pub enum Error {
+pub enum Error<'a> {
     MissingTypeDefinition {
-        name: String,
+        name: &'a str,
     },
     Unbound {
-        ident: String,
+        ident: &'a str,
         span: Span,
     },
     Mismatch {
@@ -24,7 +24,7 @@ pub enum Error {
         span: Span,
     },
     UnexpectedField {
-        ident: String,
+        ident: &'a str,
         span: Span,
     },
     InvalidTypeForUnOp {
@@ -45,11 +45,11 @@ pub enum Error {
         span: Span,
     },
     InvalidMethod {
-        ident: String,
+        ident: &'a str,
         span: Span,
     },
 }
-impl Error {
+impl Error<'_> {
     pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
         match self {
             Self::MalformedControlFow { span } => {
@@ -174,12 +174,8 @@ pub enum Type {
     Float,
     Integer,
     String,
-    Struct(TypeId),
-    Func {
-        args: Vec<NType>,
-        ret: Box<NType>,
-        with_self: bool,
-    },
+    Struct(TypeId, String),
+    Func { args: Vec<NType>, ret: Box<NType> },
     Infer(usize),
 }
 
@@ -235,17 +231,9 @@ impl fmt::Display for Type {
             Type::Float => "float",
             Type::Integer => "int",
             Type::String => "str",
-            Type::Struct(id) => return f.write_fmt(format_args!("#{id}")),
-            Type::Func {
-                args,
-                ret,
-                with_self,
-            } => {
-                if *with_self {
-                    f.write_str("fn:(")?;
-                } else {
-                    f.write_str("fn(")?;
-                }
+            Type::Struct(id, name) => return f.write_fmt(format_args!("#{name}")),
+            Type::Func { args, ret } => {
+                f.write_str("fn(")?;
                 for (i, arg) in args.iter().enumerate() {
                     if i != 0 {
                         f.write_char(',')?;
@@ -306,7 +294,7 @@ impl<'a> Context<'a> {
         self.infer_id
     }
 
-    pub fn get(&self, ident: &str, span: Span) -> Result<NType, Error> {
+    pub fn get(&self, ident: &'a str, span: Span) -> Result<NType, Error<'a>> {
         for scope in self.scopes.iter().rev() {
             if let Some(typ) = scope.get(ident) {
                 if let Type::Infer(x) = &typ.inner {
@@ -320,10 +308,7 @@ impl<'a> Context<'a> {
                 return Ok(typ.to_owned());
             }
         }
-        Err(Error::Unbound {
-            ident: ident.to_owned(),
-            span,
-        })
+        Err(Error::Unbound { ident, span })
     }
     pub fn set(
         &mut self,
@@ -331,16 +316,7 @@ impl<'a> Context<'a> {
         ident: &'a str,
         mut typ: NType,
         span: Span,
-    ) -> Result<(), Error> {
-        // if let Type::Func {
-        //     with_self: with_self @ true,
-        //     args,
-        //     ..
-        // } = &mut typ.inner
-        // {
-        //     *with_self = false;
-        //     args.remove(0);
-        // }
+    ) -> Result<(), Error<'a>> {
         if local {
             let scope = self.scopes.last_mut().unwrap();
             let shadow = scope.insert(ident, typ);
@@ -377,10 +353,7 @@ impl<'a> Context<'a> {
                 });
             }
         }
-        Err(Error::Unbound {
-            ident: ident.to_owned(),
-            span,
-        })
+        Err(Error::Unbound { ident, span })
     }
 }
 
@@ -397,7 +370,7 @@ fn process_type<'a>(names: &mut HashMap<&'a str, TypeId>, typ: &'a ast::Type) ->
                 other => {
                     let id = names.len();
                     let id = names.entry(other).or_insert(id);
-                    Type::Struct(*id)
+                    Type::Struct(*id, name.data.clone())
                 }
             },
         ),
@@ -415,7 +388,6 @@ fn process_type<'a>(names: &mut HashMap<&'a str, TypeId>, typ: &'a ast::Type) ->
                 Type::Func {
                     args,
                     ret: Box::new(ret),
-                    with_self: false,
                 },
             )
         }
@@ -423,7 +395,7 @@ fn process_type<'a>(names: &mut HashMap<&'a str, TypeId>, typ: &'a ast::Type) ->
     NType { nesting, inner }
 }
 
-pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
+pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error<'a>> {
     let mut protos = HashMap::new();
     let mut names = HashMap::new();
     for stmt in stmts {
@@ -455,7 +427,6 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
             inner: Type::Func {
                 args: vec![ANY],
                 ret: Box::new(INTEGER),
-                with_self: false,
             },
         },
     );
@@ -470,13 +441,11 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
                         inner: Type::Func {
                             args: vec![],
                             ret: Box::new(NIL),
-                            with_self: false,
                         },
                     },
                     INTEGER,
                 ],
                 ret: Box::new(NIL),
-                with_self: false,
             },
         },
     );
@@ -490,7 +459,6 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
                     inner: Type::String,
                 }],
                 ret: Box::new(STRING),
-                with_self: false,
             },
         },
     );
@@ -501,7 +469,6 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
             inner: Type::Func {
                 args: vec![],
                 ret: Box::new(NIL),
-                with_self: false,
             },
         },
     );
@@ -523,9 +490,7 @@ pub fn run<'a>(stmts: &'a [Spanned<Stmt>]) -> Result<Prototypes<'a>, Error> {
     let mut sizes = HashMap::new();
     for (name, tid) in ctx.names {
         let Some(proto) = ctx.protos.remove(&tid) else {
-            return Err(Error::MissingTypeDefinition {
-                name: name.to_owned(),
-            });
+            return Err(Error::MissingTypeDefinition { name });
         };
         sizes.insert(name, proto.fields.len());
         for (offset, (member, typ)) in proto.fields.into_iter().enumerate() {
@@ -539,18 +504,10 @@ fn eval_call<'a>(
     ctx: &mut Context<'a>,
     expr: &'a Spanned<Expr>,
     exprs: &'a [Spanned<Expr>],
-) -> Result<NType, Error> {
+) -> Result<NType, Error<'a>> {
     let typ = eval_expr(ctx, expr)?;
     if typ.nesting == 0 {
-        if let Type::Func {
-            mut args,
-            ret,
-            with_self,
-        } = typ.inner
-        {
-            if with_self {
-                args.remove(0);
-            }
+        if let Type::Func { mut args, ret } = typ.inner {
             if args.len() != exprs.len() {
                 return Err(Error::WrongNumberOfElements {
                     expected: args.len(),
@@ -577,7 +534,7 @@ fn eval_call<'a>(
     })
 }
 
-fn eval_func<'a>(ctx: &mut Context<'a>, body: &'a FuncBody) -> Result<NType, Error> {
+fn eval_func<'a>(ctx: &mut Context<'a>, body: &'a FuncBody) -> Result<NType, Error<'a>> {
     let mut scope = Scope::default();
     let mut args = Vec::with_capacity(body.args.len());
     for arg in &body.args.data {
@@ -597,11 +554,7 @@ fn eval_func<'a>(ctx: &mut Context<'a>, body: &'a FuncBody) -> Result<NType, Err
     let ret = Box::new(ret.data);
     Ok(NType {
         nesting: 0,
-        inner: Type::Func {
-            args,
-            ret,
-            with_self: false,
-        },
+        inner: Type::Func { args, ret },
     })
 }
 
@@ -609,7 +562,7 @@ pub fn eval_stmts<'a>(
     ctx: &mut Context<'a>,
     stmts: &'a [Spanned<Stmt>],
     ret: Option<&Spanned<NType>>,
-) -> Result<(), Error> {
+) -> Result<(), Error<'a>> {
     for stmt in stmts {
         eval_stmt(ctx, stmt, ret)?;
     }
@@ -620,7 +573,7 @@ pub fn eval_stmt<'a>(
     ctx: &mut Context<'a>,
     stmt: &'a Spanned<Stmt>,
     ret: Option<&Spanned<NType>>,
-) -> Result<(), Error> {
+) -> Result<(), Error<'a>> {
     match &stmt.data {
         Stmt::TypeDef { .. } => {}
         Stmt::Break => {}
@@ -734,7 +687,7 @@ pub fn eval_stmt<'a>(
     Ok(())
 }
 
-pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<NType, Error> {
+pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<NType, Error<'a>> {
     let inner = match &expr.data {
         Expr::Nil => Type::Infer(ctx.fresh()),
         Expr::True => Type::Boolean,
@@ -886,7 +839,7 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
                             }
                         }
                         return Err(Error::UnexpectedField {
-                            ident: name.to_owned(),
+                            ident: name,
                             span: field.span,
                         });
                     }
@@ -905,41 +858,36 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
                             }
                         }
                         return Err(Error::UnexpectedField {
-                            ident: name.to_string(),
+                            ident: name,
                             span: name.span,
                         });
                     }
                 }
             }
-            Type::Struct(proto_id)
+            Type::Struct(proto_id, name.data.clone())
         }
         Expr::Func { body } => eval_func(ctx, body)?.inner,
         Expr::Member {
-            with_self,
             expr,
             member,
+            with_self,
         } => {
             let self_typ = eval_expr(ctx, expr)?;
             if self_typ.nesting != 0 {
                 panic!("expected struct");
             }
-            let Type::Struct(proto_id) = self_typ.inner else {
+            let Type::Struct(proto_id, _) = self_typ.inner else {
                 panic!("expected struct")
             };
             let Some(proto) = ctx.protos.get(&proto_id) else {
-                unreachable!();
+                panic!("expected defined struct")
             };
             for (name, typ) in &proto.fields {
                 if member.as_str() == *name {
                     if *with_self {
                         if typ.nesting == 0 {
                             log!("-- nest");
-                            if let Type::Func {
-                                args,
-                                ret,
-                                with_self: false,
-                            } = &typ.inner
-                            {
+                            if let Type::Func { args, ret } = &typ.inner {
                                 log!("-- func");
                                 if let Some(arg_typ) = args.first() {
                                     log!("-- first");
@@ -948,9 +896,8 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
                                         let typ = NType {
                                             nesting: 0,
                                             inner: Type::Func {
-                                                args: args.clone(),
+                                                args: args[1..].iter().cloned().collect(),
                                                 ret: ret.clone(),
-                                                with_self: true,
                                             },
                                         };
                                         return Ok(typ);
@@ -959,7 +906,7 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
                             }
                         }
                         return Err(Error::InvalidMethod {
-                            ident: member.to_string(),
+                            ident: member,
                             span: member.span,
                         });
                     } else {
@@ -968,7 +915,7 @@ pub fn eval_expr<'a>(ctx: &mut Context<'a>, expr: &'a Spanned<Expr>) -> Result<N
                 }
             }
             return Err(Error::UnexpectedField {
-                ident: member.to_string(),
+                ident: member,
                 span: member.span,
             });
         }

@@ -156,11 +156,10 @@ impl<'a> Parser<'a> {
             while !self.current().same_kind_as(&Token::RParen) {
                 let arg = self.expect_type(Some("parameter type"))?;
                 args.push(arg);
-                if self.current().same_kind_as(&Token::Comma) {
-                    self.advance();
-                } else {
+                if !self.current().same_kind_as(&Token::Comma) {
                     break;
                 }
+                self.advance();
             }
             last_span = self.expect(Token::RParen, None, None)?;
             let ret = if self.current().same_kind_as(&Token::Colon) {
@@ -320,6 +319,9 @@ impl<'a> Parser<'a> {
                     let typ = self.expect_type(Some("arg type"))?;
                     args_end = typ.span;
                     args.push(name.span.merge(typ.span).attach(ArgDef { name, typ }));
+                    if !self.current().same_kind_as(&Token::Comma) {
+                        break;
+                    }
                 }
                 let args = args_start.merge(args_end).attach(args);
                 let last_span = self.current().span;
@@ -672,11 +674,10 @@ impl<'a> Parser<'a> {
                                         .attach(FieldConstructor::Explicit { name, expr }),
                                 );
                             }
-                            if self.current().same_kind_as(&Token::Comma) {
-                                self.advance();
-                            } else {
+                            if !self.current().same_kind_as(&Token::Comma) {
                                 break;
                             }
+                            self.advance();
                         }
                         let fields = field_start.merge(field_end).attach(fields);
                         let last_span = self.expect(Token::RBrace, None, None)?;
@@ -711,11 +712,10 @@ impl<'a> Parser<'a> {
             let expr = self.parse_expr()?;
             last_span = expr.span;
             exprs.push(expr);
-            if self.current().same_kind_as(&Token::Comma) {
-                self.advance();
-            } else {
+            if !self.current().same_kind_as(&Token::Comma) {
                 break;
             }
+            self.advance();
         }
         Ok(span.merge(last_span).attach(exprs))
     }
